@@ -1,0 +1,26 @@
+# Backend
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Data validation / structured outputs
+pydantic
+
+# SQL parsing / security proxy
+sqlglot
+
+# HTTP/API access
+httpx
+requests
+
+# Data analysis
+pandas
+numpy
+
+# Testing
+pytest
+pytest-asyncio

@@ -15,25 +15,20 @@ class InvestigationPlan(BaseModel):
 
 
 class QuestionPlanner:
-    """
-    Creates an investigation plan from a natural-language question.
-
-    For now this is a deterministic prototype.
-    Later, the LLM will generate the plan.
-    """
 
     def create_plan(self, question: str) -> InvestigationPlan:
+
         question = question.strip()
 
         if not question:
             raise ValueError("Question cannot be empty")
 
-        # Temporary planning logic.
-        # We will replace this with an LLM-based planner later.
         if "ortholog" in question.lower():
+
             return InvestigationPlan(
                 original_question=question,
                 goal="Find genes associated with human orthologs",
+
                 sub_questions=[
                     SubQuestion(
                         id=1,
@@ -44,6 +39,7 @@ class QuestionPlanner:
                             "gene name",
                         ],
                     ),
+
                     SubQuestion(
                         id=2,
                         question="Which FlyBase genes have human orthologs?",
@@ -55,7 +51,6 @@ class QuestionPlanner:
                 ],
             )
 
-        # Generic fallback
         return InvestigationPlan(
             original_question=question,
             goal=question,
@@ -70,6 +65,7 @@ class QuestionPlanner:
 
 
 if __name__ == "__main__":
+
     planner = QuestionPlanner()
 
     question = "Which genes have human orthologs?"

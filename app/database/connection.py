@@ -1,51 +1,29 @@
-import os
-
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-
-load_dotenv()
+from dataclasses import dataclass
+from typing import Any
 
 
-def create_db_engine() -> Engine:
-    host = os.getenv("FLYBASE_DB_HOST")
-    port = os.getenv("FLYBASE_DB_PORT", "5432")
-    database = os.getenv("FLYBASE_DB_NAME")
-    user = os.getenv("FLYBASE_DB_USER")
+@dataclass(frozen=True)
+class DatabaseConnection:
+    """
+    Represents a database connection configuration.
 
-    if not all([host, database, user]):
-        raise ValueError("Missing FlyBase database configuration in .env")
+    This object is database-engine agnostic.
+    """
 
-    database_url = (
-        f"postgresql+psycopg2://"
-        f"{user}@{host}:{port}/{database}"
-    )
+    connection_id: str
 
-    return create_engine(
-        database_url,
-        pool_pre_ping=True,
-        pool_recycle=300,
-    )
+    organization_id: str
+    workspace_id: str
 
+    name: str
+    database_type: str
 
-engine = create_db_engine()
+    host: str | None = None
+    port: int | None = None
+    database_name: str | None = None
+    username: str | None = None
+    password: str | None = None
 
+    ssl_enabled: bool = True
 
-def test_connection() -> bool:
-    try:
-        with engine.connect() as connection:
-            result = connection.execute(
-                text("SELECT current_database();")
-            )
-            database_name = result.scalar()
-
-            print(f"Connected to database: {database_name}")
-            return True
-
-    except Exception as error:
-        print(f"Database connection failed: {error}")
-        return False
-
-
-if __name__ == "__main__":
-    test_connection()
+    options: dict[str, Any] | None = None

@@ -1,198 +1,306 @@
-from sqlalchemy import inspect
+import re
 
-from app.database.connection import engine
-
-
-SEARCH_SCHEMAS = [
-    "gene",
-    "dataclass",
-    "dataclass_relationship",
-    "gene_group",
-    "humanhealth",
-]
+from app.database.adapters.base import DatabaseAdapter
 
 
 def normalize(text: str) -> str:
-    return text.lower().replace("_", " ").replace("-", " ")
+    return (
+        str(text)
+        .lower()
+        .replace("_", " ")
+        .replace("-", " ")
+    )
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(
+        r"[a-z0-9]+",
+        normalize(text),
+    )
+
+
+def _column_name(column) -> str:
+    if isinstance(column, dict):
+        return str(
+            column.get(
+                "name",
+                column.get(
+                    "column",
+                    "",
+                ),
+            )
+        )
+
+    return str(column)
+
+
+def _foreign_key_text(foreign_key) -> str:
+    if not isinstance(foreign_key, dict):
+        return str(foreign_key)
+
+    return " ".join(
+        str(value)
+        for key, value in foreign_key.items()
+        if key in {
+            "column",
+            "source_column",
+            "referred_column",
+            "referred_table",
+            "referred_schema",
+            "target_column",
+            "target_table",
+            "target_schema",
+        }
+        and value
+    )
 
 
 def score_table(
     table_name: str,
-    required_information: list[str]
+    required_information: list[str],
+    columns: list | None = None,
+    foreign_keys: list | None = None,
 ) -> tuple[int, list[str]]:
 
-    table_text = normalize(table_name)
+    columns = columns or []
+    foreign_keys = foreign_keys or []
+
+    searchable_parts = [
+        table_name,
+        *[
+            _column_name(column)
+            for column in columns
+        ],
+        *[
+            _foreign_key_text(foreign_key)
+            for foreign_key in foreign_keys
+        ],
+    ]
+
+    searchable_text = normalize(
+        " ".join(searchable_parts)
+    )
+
+    searchable_tokens = set(
+        tokenize(searchable_text)
+    )
+
+    table_tokens = set(
+        tokenize(table_name)
+    )
 
     score = 0
     matched_terms = []
 
     for information in required_information:
 
-        info_text = normalize(information)
-        words = info_text.split()
+        info_text = normalize(
+            information
+        ).strip()
 
-        if info_text in table_text:
+        if not info_text:
+            continue
+
+        words = tokenize(info_text)
+
+        if not words:
+            continue
+
+        # Exact phrase.
+        if info_text in searchable_text:
             score += 20
             matched_terms.append(information)
             continue
 
-        if all(word in table_text for word in words):
-            score += 10
-            matched_terms.append(information)
-            continue
-
+        # Individual meaningful terms.
         important_words = [
             word
             for word in words
-            if len(word) > 3
+            if len(word) > 2
         ]
 
-        matched_words = [
+        if not important_words:
+            continue
+
+        matches = [
             word
             for word in important_words
-            if word in table_text
+            if word in searchable_tokens
         ]
 
-        if matched_words:
-            score += len(matched_words) * 2
+        if len(matches) == len(important_words):
+            score += 15
             matched_terms.append(information)
+            continue
 
-    if "relationship" in table_name.lower():
-        score += 2
+        if len(matches) >= 2:
+            score += min(
+                12,
+                len(matches) * 3,
+            )
+            matched_terms.append(information)
+            continue
+
+        # Single highly meaningful table/column term.
+        if len(matches) == 1:
+            score += 5
+            matched_terms.append(information)
 
     return score, matched_terms
 
 
 def find_relevant_tables(
+    adapter: DatabaseAdapter,
     required_information: list[str],
-    max_results: int = 3
+    schemas: list[str] | None = None,
+    max_results: int = 6,
 ):
-    inspector = inspect(engine)
 
     results = []
 
-    for schema in SEARCH_SCHEMAS:
+    if schemas is None:
+        schemas = adapter.get_schemas()
 
-        tables = inspector.get_table_names(
+    for schema in schemas:
+
+        tables = adapter.get_tables(
             schema=schema
         )
 
         for table in tables:
 
-            score, matched_terms = score_table(
-                table,
-                required_information
+            details = adapter.get_schema(
+                schema=schema,
+                table=table,
             )
 
-            if score == 0:
+            score, matched_terms = score_table(
+                table_name=table,
+                required_information=(
+                    required_information
+                ),
+                columns=details.get(
+                    "columns",
+                    [],
+                ),
+                foreign_keys=details.get(
+                    "foreign_keys",
+                    [],
+                ),
+            )
+
+            if score <= 0:
                 continue
 
-            results.append({
-                "schema": schema,
-                "table": table,
-                "score": score,
-                "matched_terms": matched_terms,
-            })
+            results.append(
+                {
+                    "schema": schema,
+                    "table": table,
+                    "score": score,
+                    "matched_terms": matched_terms,
+                    "details": details,
+                }
+            )
 
     results.sort(
-        key=lambda result: result["score"],
-        reverse=True
+        key=lambda result: (
+            -result["score"],
+            result["schema"],
+            result["table"],
+        )
     )
 
     return results[:max_results]
 
 
-def get_table_details(
-    inspector,
-    schema: str,
-    table: str,
-    score: int | None = None,
-    matched_terms: list[str] | None = None,
-):
-    columns = inspector.get_columns(
-        table,
-        schema=schema
-    )
-
-    primary_key = inspector.get_pk_constraint(
-        table,
-        schema=schema
-    )
-
-    foreign_keys = inspector.get_foreign_keys(
-        table,
-        schema=schema
-    )
-
-    return {
-        "schema": schema,
-        "table": table,
-        "score": score,
-        "matched_terms": matched_terms or [],
-        "columns": [
-            {
-                "name": column["name"],
-                "type": str(column["type"]),
-                "nullable": column["nullable"],
-            }
-            for column in columns
-        ],
-        "primary_key": primary_key.get(
-            "constrained_columns",
-            []
-        ),
-        "foreign_keys": [
-            {
-                "columns": fk["constrained_columns"],
-                "referred_schema": fk["referred_schema"],
-                "referred_table": fk["referred_table"],
-                "referred_columns": fk["referred_columns"],
-            }
-            for fk in foreign_keys
-        ],
-    }
-
-
 def get_relevant_schema(
+    adapter: DatabaseAdapter,
     required_information: list[str],
-    max_results: int = 3,
+    schemas: list[str] | None = None,
+    max_results: int = 6,
 ):
-    inspector = inspect(engine)
 
     candidates = find_relevant_tables(
-        required_information,
+        adapter=adapter,
+        required_information=required_information,
+        schemas=schemas,
         max_results=max_results,
     )
 
     schema_context = []
-    added_tables = set()
+
+    added_tables: set[
+        tuple[str, str]
+    ] = set()
 
     for candidate in candidates:
 
         schema = candidate["schema"]
         table = candidate["table"]
 
-        table_key = (schema, table)
+        table_key = (
+            schema,
+            table,
+        )
 
         if table_key in added_tables:
             continue
 
-        details = get_table_details(
-            inspector,
-            schema,
-            table,
-            candidate["score"],
-            candidate["matched_terms"],
+        details = candidate["details"]
+
+        details = dict(details)
+
+        details["score"] = (
+            candidate["score"]
+        )
+
+        details["matched_terms"] = (
+            candidate["matched_terms"]
         )
 
         schema_context.append(details)
+
         added_tables.add(table_key)
 
-        # Follow foreign keys to discover tables needed for joins.
-        for fk in details["foreign_keys"]:
+    # --------------------------------------------------
+    # Include FK-related tables.
+    # --------------------------------------------------
 
-            referred_schema = fk["referred_schema"]
-            referred_table = fk["referred_table"]
+    index = 0
+
+    while index < len(schema_context):
+
+        details = schema_context[index]
+        index += 1
+
+        for foreign_key in details.get(
+            "foreign_keys",
+            [],
+        ):
+
+            if not isinstance(
+                foreign_key,
+                dict,
+            ):
+                continue
+
+            referred_schema = (
+                foreign_key.get(
+                    "referred_schema"
+                )
+            )
+
+            referred_table = (
+                foreign_key.get(
+                    "referred_table"
+                )
+            )
+
+            if (
+                not referred_schema
+                or not referred_table
+            ):
+                continue
 
             referred_key = (
                 referred_schema,
@@ -202,60 +310,19 @@ def get_relevant_schema(
             if referred_key in added_tables:
                 continue
 
-            referred_details = get_table_details(
-                inspector,
-                referred_schema,
-                referred_table,
+            referred_details = (
+                adapter.get_schema(
+                    schema=referred_schema,
+                    table=referred_table,
+                )
             )
 
             schema_context.append(
                 referred_details
             )
 
-            added_tables.add(referred_key)
-
-    return schema_context
-
-
-if __name__ == "__main__":
-
-    required_information = [
-        "FlyBase gene",
-        "human ortholog",
-    ]
-
-    print(
-        "Building relationship-aware schema context...\n",
-        flush=True,
-    )
-
-    context = get_relevant_schema(
-        required_information
-    )
-
-    for table in context:
-
-        print(
-            f"\nTABLE: "
-            f"{table['schema']}.{table['table']}"
-        )
-
-        print("COLUMNS:")
-
-        for column in table["columns"]:
-
-            print(
-                f"  {column['name']} "
-                f"| {column['type']} "
-                f"| nullable={column['nullable']}"
+            added_tables.add(
+                referred_key
             )
 
-        print(
-            f"PRIMARY KEY: "
-            f"{table['primary_key']}"
-        )
-
-        print("FOREIGN KEYS:")
-
-        for fk in table["foreign_keys"]:
-            print(f"  {fk}")
+    return schema_context

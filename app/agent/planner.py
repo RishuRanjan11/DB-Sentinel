@@ -51,6 +51,7 @@ class QuestionPlanner:
     def create_plan(
         self,
         question: str,
+        conversation_history: list[dict] | None = None,
     ) -> InvestigationPlan:
 
         question = question.strip()
@@ -392,11 +393,24 @@ OUTPUT
 Return structured output only.
 """
 
+        history = conversation_history or []
+        history_text = "\n\n".join(
+            f"Turn {index}:\nQuestion: {item.get('question', '')}\nResult summary: {item.get('result', {})}"
+            for index, item in enumerate(history[-5:], start=1)
+        )
+
         user_prompt = f"""
 Create an investigation plan for the following ORIGINAL
 USER QUESTION:
 
 {question}
+
+CONVERSATION CONTEXT:
+{history_text or 'No previous conversation context.'}
+
+Use previous conversation context only to resolve references such as
+'it', 'that region', 'the previous result', or similar follow-up
+references. The current user question remains authoritative.
 
 The original question is authoritative.
 

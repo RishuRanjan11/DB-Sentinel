@@ -30,6 +30,7 @@ class SQLPipeline:
         connection_id: str,
         question: str,
         required_information: list[str],
+        organization_id: str | None = None,
         complexity: str | None = None,
         schema_context: list[dict] | None = None,
         feedback: str | None = None,
@@ -39,7 +40,8 @@ class SQLPipeline:
     ) -> dict:
 
         adapter = self.database_manager.get(
-            connection_id
+            connection_id,
+            organization_id=organization_id,
         )
 
         if schema_context is None:
@@ -357,8 +359,10 @@ class SQLPipeline:
         sql: str,
         schema_context: list[dict],
         initial_rows: list[dict],
+        organization_id: str | None = None,
         page_size: int = 100,
         max_pages: int = 1000,
+        expected_top_n: int | None = None,
     ) -> dict:
         """
         Complete a bounded collection query without removing the
@@ -412,20 +416,32 @@ class SQLPipeline:
                 "reason": "The first bounded page is smaller than the page size.",
             }
 
-        if re.search(r"\bcount\s*\(", normalized):
+        if re.search(r"\bgroup\s+by\b", normalized):
+            if expected_top_n == len(initial_rows):
+                return {
+                    "rows": list(initial_rows),
+                    "complete": True,
+                    "pages": 1,
+                    "reason": (
+                        "The requested Top-N grouped result is complete."
+                    ),
+                }
             return {
                 "rows": list(initial_rows),
-                "complete": True,
+                "complete": False,
                 "pages": 1,
-                "reason": "Aggregate COUNT query does not require pagination.",
+                "reason": (
+                    "The grouped query reached its row limit; the complete "
+                    "group set cannot be established within the current cap."
+                ),
             }
 
-        if re.search(r"\bgroup\s+by\b", normalized):
+        if re.search(r"\bcount\s*\(", normalized):
             return {
-                "rows": list(initial_rows),
-                "complete": True,
-                "pages": 1,
-                "reason": "Grouped query is treated as a bounded analytical result.",
+            "rows": list(initial_rows),
+            "complete": True,
+            "pages": 1,
+            "reason": "Aggregate COUNT query does not require pagination.",
             }
 
         if not re.search(r"\border\s+by\b", normalized):
@@ -439,7 +455,45 @@ class SQLPipeline:
                 ),
             }
 
-        adapter = self.database_manager.get(connection_id)
+        order_by_match = re.search(
+            r"\border\s+by\b(.*?)(?:\blimit\b|\boffset\b|$)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        order_by_clause = (
+            order_by_match.group(1)
+            if order_by_match
+            else ""
+        )
+        primary_keys = {
+            key.lower()
+            for table in schema_context
+            for key in self._primary_key_names(table)
+        }
+        has_primary_key_tiebreaker = any(
+            re.search(
+                rf"(?<![a-z0-9_])(?:[a-z_][a-z0-9_]*\.)?"
+                rf"{re.escape(key)}(?![a-z0-9_])",
+                order_by_clause,
+            )
+            for key in primary_keys
+        )
+        if not has_primary_key_tiebreaker:
+            return {
+                "rows": list(initial_rows),
+                "complete": False,
+                "pages": 1,
+                "reason": (
+                    "A complete multi-page collection requires an "
+                    "ORDER BY that includes a primary-key tie-breaker "
+                    "from the supplied schema."
+                ),
+            }
+
+        adapter = self.database_manager.get(
+            connection_id,
+            organization_id=organization_id,
+        )
 
         allowed_tables = {
             (
@@ -566,6 +620,25 @@ class SQLPipeline:
                 "before proving completeness."
             ),
         }
+
+    @staticmethod
+    def _primary_key_names(table: dict) -> list[str]:
+        keys = table.get(
+            "primary_keys",
+            table.get("primary_key", []),
+        )
+        if isinstance(keys, (str, dict)):
+            keys = [keys]
+
+        names = []
+        for key in keys:
+            if isinstance(key, dict):
+                name = key.get("column", key.get("name"))
+            else:
+                name = key
+            if name:
+                names.append(str(name))
+        return names
 
     @staticmethod
     def _with_offset(

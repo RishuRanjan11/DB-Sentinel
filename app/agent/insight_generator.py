@@ -301,6 +301,46 @@ class InsightGenerator:
             uncertainties=[],
         )
 
+    @staticmethod
+    def _large_complete_collection(
+        question: str,
+        evidence: list[Evidence],
+    ) -> GeneratedInsight | None:
+        asks_for_collection = bool(
+            re.search(r"\b(?:which|list|show|find)\b", question or "", re.I)
+        )
+        asks_for_metric_or_ranking = bool(
+            re.search(
+                r"\b(?:how many|number of|count|compare|comparison|top|most|highest|largest|maximum|least|lowest|smallest|minimum|rank|ranking)\b",
+                question or "",
+                re.I,
+            )
+        )
+        complete = bool(evidence) and all(
+            item.pagination_complete for item in evidence
+        )
+        if (
+            not asks_for_collection
+            or asks_for_metric_or_ranking
+            or not complete
+            or sum(len(item.rows) for item in evidence) <= 100
+        ):
+            return None
+
+        return GeneratedInsight(
+            summary=(
+                "The complete matching result is available in the verified "
+                "evidence rows. The summary intentionally does not enumerate "
+                "a large result set."
+            ),
+            findings=[],
+            supporting_evidence=[
+                f"Verified step {item.step_id}: {item.objective}"
+                for item in evidence
+            ],
+            uncertainties=[],
+        )
+
     def _build_evidence_text(self, evidence: list[Evidence]) -> list[dict[str, Any]]:
         return [
             {
@@ -310,6 +350,7 @@ class InsightGenerator:
                 "rows": item.rows[:100],
                 "logical_verification": item.logical_reason,
                 "confidence": item.confidence,
+                "pagination_complete": item.pagination_complete,
             }
             for item in evidence
         ]
@@ -334,7 +375,8 @@ For why/explanation questions, distinguish observed measurements and
 associations from causation. Do not invent causal explanations.
 
 Respect LIMITs and do not claim completeness from a limited non-aggregate
-result.
+result. Evidence explicitly marked pagination_complete is complete even
+though the underlying page queries use LIMIT.
 
 Return only the requested structured insight.
 """
@@ -473,6 +515,10 @@ Verified evidence:
         ranking = self._deterministic_ranking(question, evidence)
         if ranking:
             return ranking
+
+        collection = self._large_complete_collection(question, evidence)
+        if collection:
+            return collection
 
         evidence_text = self._build_evidence_text(evidence)
         insight = self._generate_once(question, evidence_text)

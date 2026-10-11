@@ -1,6 +1,7 @@
 import re
 
 from app.database.adapters.base import DatabaseAdapter
+from app.database.data_dictionary import DatabaseDictionary
 
 
 def normalize(text: str) -> str:
@@ -13,10 +14,27 @@ def normalize(text: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    return re.findall(
+    """Tokenize text and add lightweight singular/plural variants.
+
+    This is intentionally lexical rather than domain-specific. It lets a
+    question such as "How many genes are there?" match a table named
+    ``gene`` without embedding any database-specific knowledge.
+    """
+    tokens = re.findall(
         r"[a-z0-9]+",
         normalize(text),
     )
+
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.append(token)
+
+        if len(token) > 3 and token.endswith("ies"):
+            expanded.append(token[:-3] + "y")
+        elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            expanded.append(token[:-1])
+
+    return expanded
 
 
 def _column_name(column) -> str:
@@ -60,6 +78,8 @@ def score_table(
     required_information: list[str],
     columns: list | None = None,
     foreign_keys: list | None = None,
+    schema_description: str = "",
+    table_description: str = "",
 ) -> tuple[int, list[str]]:
 
     columns = columns or []
@@ -67,8 +87,19 @@ def score_table(
 
     searchable_parts = [
         table_name,
+        schema_description,
+        table_description,
         *[
-            _column_name(column)
+            " ".join(
+                (
+                    _column_name(column),
+                    str(
+                        column.get("dictionary_description", "")
+                    )
+                    if isinstance(column, dict)
+                    else "",
+                )
+            )
             for column in columns
         ],
         *[
@@ -154,6 +185,7 @@ def find_relevant_tables(
     required_information: list[str],
     schemas: list[str] | None = None,
     max_results: int = 6,
+    data_dictionary: DatabaseDictionary | None = None,
 ):
 
     results = []
@@ -173,6 +205,10 @@ def find_relevant_tables(
                 schema=schema,
                 table=table,
             )
+            if data_dictionary:
+                details = data_dictionary.enrich_schema_context(
+                    [{**details, "schema": schema, "table": table}]
+                )[0]
 
             score, matched_terms = score_table(
                 table_name=table,
@@ -186,6 +222,14 @@ def find_relevant_tables(
                 foreign_keys=details.get(
                     "foreign_keys",
                     [],
+                ),
+                schema_description=details.get(
+                    "dictionary_schema_description",
+                    "",
+                ),
+                table_description=details.get(
+                    "dictionary_description",
+                    "",
                 ),
             )
 
@@ -218,6 +262,7 @@ def get_relevant_schema(
     required_information: list[str],
     schemas: list[str] | None = None,
     max_results: int = 6,
+    data_dictionary: DatabaseDictionary | None = None,
 ):
 
     candidates = find_relevant_tables(
@@ -225,6 +270,7 @@ def get_relevant_schema(
         required_information=required_information,
         schemas=schemas,
         max_results=max_results,
+        data_dictionary=data_dictionary,
     )
 
     schema_context = []

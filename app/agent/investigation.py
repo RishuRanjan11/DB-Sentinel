@@ -1,3 +1,7 @@
+import hashlib
+import re
+import uuid
+
 from app.agent.planner import QuestionPlanner
 from app.agent.sql_pipeline import SQLPipeline
 from app.agent.logical_verifier import LogicalVerifier
@@ -10,6 +14,11 @@ from app.llm.model_router import create_default_model_router
 from app.security.policies import RequestPolicy
 from app.security.permissions import DatabasePermissions
 from app.core.trace import logger
+from app.analysis.intent import AnalysisIntent, AnalysisIntentClassifier
+from app.analysis.explorer import DatabaseExplorer
+from app.reporting.artifacts import build_artifacts
+from app.core.console import safe_text
+from app.database.data_dictionary import DatabaseDictionary
 
 
 class InvestigationEngine:
@@ -46,6 +55,11 @@ class InvestigationEngine:
             model_router=self.model_router
         )
 
+        self.intent_classifier = AnalysisIntentClassifier()
+        self.database_explorer = DatabaseExplorer(
+            model_router=self.model_router
+        )
+
         self.sql_pipeline = SQLPipeline(
             database_manager=database_manager,
             model_router=self.model_router,
@@ -55,7 +69,40 @@ class InvestigationEngine:
         self,
         connection_id: str,
         question: str,
+        organization_id: str | None = None,
+        conversation_history: list[dict] | None = None,
+        data_dictionary: DatabaseDictionary | None = None,
     ) -> dict:
+        investigation_id = uuid.uuid4().hex[:12]
+        question_hash = hashlib.sha256(
+            question.encode("utf-8")
+        ).hexdigest()[:16]
+        logger.info(
+            "INVESTIGATION START id=%s organization=%s connection=%s "
+            "question_sha256=%s dictionary=%s",
+            investigation_id,
+            organization_id or "unspecified",
+            connection_id,
+            question_hash,
+            bool(data_dictionary),
+        )
+
+        # ==================================================
+        # 0. TENANT / DATABASE BOUNDARY
+        # ==================================================
+
+        connection = self.database_manager.get_connection(
+            connection_id
+        )
+
+        if (
+            organization_id is not None
+            and connection.organization_id != organization_id
+        ):
+            raise PermissionError(
+                f"Database connection '{connection_id}' does not belong "
+                f"to organization '{organization_id}'."
+            )
 
         # ==================================================
         # 1. SECURITY POLICY
@@ -83,7 +130,8 @@ class InvestigationEngine:
             )
 
             logger.warning(
-                "REQUEST BLOCKED operation=%s reason=%s",
+                "INVESTIGATION BLOCKED id=%s operation=%s reason=%s",
+                investigation_id,
                 policy_decision.operation,
                 reason,
             )
@@ -107,11 +155,93 @@ class InvestigationEngine:
             }
 
         # ==================================================
-        # 2. CREATE INVESTIGATION PLAN
+        # 2. DATABASE EXPLORATION
+        # ==================================================
+
+        intent = self.intent_classifier.classify(question)
+        logger.info(
+            "INVESTIGATION CLASSIFIED id=%s intent=%s",
+            investigation_id,
+            intent.value,
+        )
+
+        if intent == AnalysisIntent.DATABASE_EXPLORATION:
+            adapter = self.database_manager.get(
+                connection_id,
+                organization_id=organization_id,
+            )
+            overview = self.database_explorer.explore(
+                question=question,
+                adapter=adapter,
+                data_dictionary=data_dictionary,
+            )
+            logger.info(
+                "EXPLORATION COMPLETE id=%s schemas=%s tables=%s "
+                "relationships=%s dictionary=%s status=verified",
+                investigation_id,
+                len(overview.schemas),
+                len(overview.tables),
+                len(overview.relationships),
+                bool(data_dictionary),
+            )
+            evidence = [{
+                "type": "database_metadata",
+                "schemas": overview.schemas,
+                "tables": overview.tables,
+                "relationships": overview.relationships,
+            }]
+            dashboard = {
+                "title": question,
+                "widgets": [{
+                    "type": "schema_overview",
+                    "title": "Database Structure",
+                    "data": {
+                        "schemas": overview.schemas,
+                        "tables": overview.tables,
+                        "relationships": overview.relationships,
+                    },
+                    "source_step_ids": [],
+                }],
+            }
+            report = {
+                "title": question,
+                "executive_summary": overview.summary,
+                "findings": [],
+                "recommendations": [],
+                "uncertainties": overview.limitations,
+                "evidence": evidence,
+            }
+            return {
+                "status": "verified",
+                "question": question,
+                "intent": intent.value,
+                "plan": None,
+                "steps": [],
+                "evidence": evidence,
+                "insight": overview.model_dump(),
+                "insight_verification": {
+                    "verified": True,
+                    "confidence": 1.0,
+                    "supported_findings": [],
+                    "unsupported_findings": [],
+                    "warnings": overview.limitations,
+                },
+                "dashboard": dashboard,
+                "report": report,
+            }
+
+        # ==================================================
+        # 3. CREATE INVESTIGATION PLAN
         # ==================================================
 
         plan = self.planner.create_plan(
-            question
+            question,
+            conversation_history=conversation_history,
+        )
+        logger.info(
+            "INVESTIGATION PLAN id=%s steps=%s",
+            investigation_id,
+            len(plan.sub_questions),
         )
 
         logger.debug(
@@ -137,6 +267,12 @@ class InvestigationEngine:
         # ==================================================
 
         for sub_question in plan.sub_questions:
+            logger.info(
+                "STEP START id=%s step=%s dependencies=%s",
+                investigation_id,
+                sub_question.id,
+                sub_question.depends_on,
+            )
 
             original_question = (
                 sub_question.question
@@ -244,7 +380,8 @@ class InvestigationEngine:
                 )
 
                 adapter = self.database_manager.get(
-                    connection_id
+                    connection_id,
+                    organization_id=organization_id,
                 )
 
                 schema_context = get_relevant_schema(
@@ -252,9 +389,24 @@ class InvestigationEngine:
                     required_information=(
                         sub_question.required_information
                     ),
+                    data_dictionary=data_dictionary,
+                )
+                logger.info(
+                    "STEP SCHEMA id=%s step=%s attempt=%s tables=%s dictionary=%s",
+                    investigation_id,
+                    sub_question.id,
+                    attempt,
+                    len(schema_context),
+                    bool(data_dictionary),
                 )
 
                 if not schema_context:
+                    logger.warning(
+                        "STEP NO_RELEVANT_SCHEMA id=%s step=%s attempt=%s",
+                        investigation_id,
+                        sub_question.id,
+                        attempt,
+                    )
 
                     attempt_result = {
                         "attempt": attempt,
@@ -290,6 +442,7 @@ class InvestigationEngine:
                     self.sql_pipeline
                     .generate_validate_and_execute(
                         connection_id=connection_id,
+                        organization_id=organization_id,
                         question=current_question,
                         required_information=(
                             sub_question.required_information
@@ -300,6 +453,12 @@ class InvestigationEngine:
                         previous_sqls=previous_sqls,
                         attempt_number=attempt,
                     )
+                )
+                sql = pipeline_result.get("sql")
+                sql_hash = (
+                    hashlib.sha256(str(sql).encode("utf-8")).hexdigest()[:16]
+                    if sql
+                    else "none"
                 )
 
                 # A bounded SELECT is a security boundary, not a semantic
@@ -317,9 +476,21 @@ class InvestigationEngine:
                 ):
                     pagination = self.sql_pipeline.collect_additional_pages(
                         connection_id=connection_id,
+                        organization_id=organization_id,
                         sql=pipeline_result["sql"],
                         schema_context=schema_context,
                         initial_rows=pipeline_result["rows"],
+                        expected_top_n=(
+                            int(top_n_match.group(1))
+                            if (
+                                top_n_match := re.search(
+                                    r"\btop\s+(\d+)\b",
+                                    original_question,
+                                    flags=re.IGNORECASE,
+                                )
+                            )
+                            else None
+                        ),
                     )
 
                     pipeline_result["rows"] = pagination["rows"]
@@ -412,6 +583,19 @@ class InvestigationEngine:
                 ].append(
                     attempt_result
                 )
+                logger.info(
+                    "STEP ATTEMPT id=%s step=%s attempt=%s sql_sha256=%s "
+                    "allowed=%s executed=%s verified=%s rows=%s reason=%s",
+                    investigation_id,
+                    sub_question.id,
+                    attempt,
+                    sql_hash,
+                    pipeline_result.get("allowed", False),
+                    pipeline_result.get("executed", False),
+                    pipeline_result.get("verified", False),
+                    pipeline_result.get("row_count", 0),
+                    pipeline_result.get("reason"),
+                )
 
                 # ==================================================
                 # SECURITY / SCHEMA FAILURE
@@ -430,7 +614,6 @@ class InvestigationEngine:
                             "reason"
                         ),
                     )
-
                     feedback = (
                         "The generated SQL was rejected by the "
                         "deterministic security/schema validator.\n\n"
@@ -462,7 +645,6 @@ class InvestigationEngine:
                             "reason"
                         ),
                     )
-
                     feedback = (
                         "The generated SQL reached PostgreSQL "
                         "but failed to execute.\n\n"
@@ -608,6 +790,16 @@ class InvestigationEngine:
                     logical_result.confidence,
                     logical_result.reason,
                 )
+                logger.info(
+                    "STEP LOGICAL_VERIFICATION id=%s step=%s attempt=%s "
+                    "relevant=%s confidence=%.3f reason=%s",
+                    investigation_id,
+                    sub_question.id,
+                    attempt,
+                    logical_result.relevant,
+                    logical_result.confidence,
+                    logical_result.reason,
+                )
 
                 attempt_result[
                     "logical_model_route"
@@ -666,6 +858,12 @@ class InvestigationEngine:
                         depends_on=list(
                             sub_question.depends_on
                         ),
+                        pagination_complete=bool(
+                            (
+                                pipeline_result.get("pagination")
+                                or {}
+                            ).get("complete", False)
+                        ),
                     )
 
                     evidence_store.add(
@@ -694,6 +892,13 @@ class InvestigationEngine:
                         "STEP %s VERIFIED on attempt %s",
                         sub_question.id,
                         attempt,
+                    )
+                    logger.info(
+                        "STEP VERIFIED id=%s step=%s attempt=%s confidence=%.3f",
+                        investigation_id,
+                        sub_question.id,
+                        attempt,
+                        logical_result.confidence,
                     )
 
                     break
@@ -776,6 +981,12 @@ class InvestigationEngine:
                     sub_question.id,
                     self.MAX_QUERY_ATTEMPTS,
                 )
+                logger.warning(
+                    "STEP FAILED id=%s step=%s attempts=%s",
+                    investigation_id,
+                    sub_question.id,
+                    len(step_result["attempts"]),
+                )
 
             step_results.append(
                 step_result
@@ -794,6 +1005,10 @@ class InvestigationEngine:
         ]
 
         if not evidence:
+            logger.warning(
+                "INVESTIGATION FAILED id=%s reason=no_verified_evidence",
+                investigation_id,
+            )
 
             return {
                 "status": "failed",
@@ -810,6 +1025,13 @@ class InvestigationEngine:
             }
 
         if failed_steps:
+            logger.warning(
+                "INVESTIGATION FAILED id=%s reason=unverified_steps "
+                "failed_steps=%s evidence=%s",
+                investigation_id,
+                [step.get("id") for step in failed_steps],
+                len(evidence),
+            )
 
             return {
                 "status": "failed",
@@ -826,6 +1048,7 @@ class InvestigationEngine:
                         "confidence": item.confidence,
                         "logical_reason": item.logical_reason,
                         "depends_on": item.depends_on,
+                        "pagination_complete": item.pagination_complete,
                     }
                     for item in evidence
                 ],
@@ -845,6 +1068,11 @@ class InvestigationEngine:
         insight = self.insight_generator.generate(
             question=question,
             evidence=evidence,
+        )
+        logger.info(
+            "INSIGHT GENERATED id=%s evidence=%s",
+            investigation_id,
+            len(evidence),
         )
 
         # ==================================================
@@ -883,31 +1111,49 @@ class InvestigationEngine:
             status = (
                 "insight_requires_review"
             )
+        logger.info(
+            "INVESTIGATION COMPLETE id=%s status=%s steps=%s evidence=%s "
+            "insight_verified=%s confidence=%.3f",
+            investigation_id,
+            status,
+            len(step_results),
+            len(evidence),
+            insight_verification.verified,
+            insight_verification.confidence,
+        )
+
+        evidence_payload = [
+            {
+                "step_id": item.step_id,
+                "question": item.question,
+                "objective": item.objective,
+                "sql": item.sql,
+                "rows": item.rows,
+                "confidence": item.confidence,
+                "logical_reason": item.logical_reason,
+                "depends_on": item.depends_on,
+                "pagination_complete": item.pagination_complete,
+            }
+            for item in evidence
+        ]
+        dashboard, report = build_artifacts(
+            question=question,
+            insight=insight.model_dump(),
+            evidence=evidence_payload,
+        )
 
         return {
             "status": status,
             "question": question,
             "plan": plan.model_dump(),
             "steps": step_results,
-            "evidence": [
-                {
-                    "step_id": item.step_id,
-                    "question": item.question,
-                    "objective": item.objective,
-                    "sql": item.sql,
-                    "rows": item.rows,
-                    "confidence": item.confidence,
-                    "logical_reason": (
-                        item.logical_reason
-                    ),
-                    "depends_on": item.depends_on,
-                }
-                for item in evidence
-            ],
+            "evidence": evidence_payload,
             "insight": insight.model_dump(),
             "insight_verification": (
                 insight_verification.model_dump()
             ),
+            "dashboard": dashboard.model_dump(),
+            "report": report.model_dump(),
         }
 
 
@@ -943,12 +1189,12 @@ def main():
     question = " ".join(
         sys.argv[1:]
     ).strip() or (
-        "How many FlyBase genes have human orthologs?"
+        "Which genes are rare and which are common"
     )
 
     print()
     print("DB-SENTINEL")
-    print("───────────")
+    print(safe_text("───────────"))
     print("Investigation engine started")
     print(
         f"Question: {question}"
@@ -963,7 +1209,7 @@ def main():
 
         print()
         print("Investigation Plan")
-        print("──────────────────")
+        print(safe_text("──────────────────"))
         plan = result.get("plan") or {}
 
         for planned_step in plan.get("sub_questions", []):
@@ -983,7 +1229,7 @@ def main():
 
         print()
         print("Result")
-        print("──────")
+        print(safe_text("──────"))
         print(
             f"Status: {result['status']}"
         )
@@ -1078,7 +1324,7 @@ def main():
 
             print()
             print("Insight")
-            print("───────")
+            print(safe_text("───────"))
 
             print(
                 insight.get(
@@ -1093,7 +1339,7 @@ def main():
             ):
 
                 print(
-                    f"• {finding}"
+                    f"{safe_text('•')} {finding}"
                 )
 
         print()

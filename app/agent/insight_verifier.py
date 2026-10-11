@@ -453,8 +453,12 @@ class InsightVerifier:
 
         for item in evidence:
             sql = (item.sql or "").lower()
-            if re.search(r"\blimit\s+\d+\b", sql) and not re.search(
+            if (
+                not item.pagination_complete
+                and re.search(r"\blimit\s+\d+\b", sql)
+                and not re.search(
                 r"\b(?:count|sum|avg|min|max)\s*\(", sql
+                )
             ):
                 warnings.append(
                     f"Evidence step {item.step_id} uses LIMIT; completeness is limited to returned rows."

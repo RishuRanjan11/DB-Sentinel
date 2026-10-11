@@ -1,67 +1,42 @@
-from sqlalchemy import inspect
-
-from app.database.connection import engine
-from app.models.schema import (
-    ColumnInfo,
-    ForeignKeyInfo,
-    TableSchema,
-    SchemaContext,
-)
+from app.database.adapters.base import DatabaseAdapter
+from app.models.schema import ColumnInfo, ForeignKeyInfo, TableSchema, SchemaContext
 
 
-def get_table_metadata(schema_name: str, table_name: str) -> TableSchema:
-    inspector = inspect(engine)
-
-    columns = inspector.get_columns(
-        table_name,
-        schema=schema_name
-    )
-
-    primary_key = inspector.get_pk_constraint(
-        table_name,
-        schema=schema_name
-    )
-
-    foreign_keys = inspector.get_foreign_keys(
-        table_name,
-        schema=schema_name
-    )
-
-    column_info = [
+def get_table_metadata(adapter: DatabaseAdapter, schema_name: str, table_name: str) -> TableSchema:
+    details = adapter.get_schema(schema=schema_name, table=table_name)
+    columns = [
         ColumnInfo(
-            name=column["name"],
-            data_type=str(column["type"]),
-            nullable=column["nullable"],
+            name=str(column.get("name", column.get("column", ""))),
+            data_type=str(column.get("data_type", "unknown")),
+            nullable=bool(column.get("nullable", True)),
         )
-        for column in columns
+        for column in details.get("columns", [])
+        if isinstance(column, dict)
     ]
 
-    foreign_key_info = [
+    foreign_keys = [
         ForeignKeyInfo(
-            column=fk["constrained_columns"][0],
-            referred_schema=fk["referred_schema"],
-            referred_table=fk["referred_table"],
-            referred_column=fk["referred_columns"][0],
+            column=str(fk.get("column", fk.get("source_column", ""))),
+            referred_schema=str(fk.get("referred_schema", fk.get("target_schema", ""))),
+            referred_table=str(fk.get("referred_table", fk.get("target_table", ""))),
+            referred_column=str(fk.get("referred_column", fk.get("target_column", ""))),
         )
-        for fk in foreign_keys
-        if len(fk["constrained_columns"]) == 1
-        and len(fk["referred_columns"]) == 1
+        for fk in details.get("foreign_keys", [])
+        if isinstance(fk, dict)
     ]
 
     return TableSchema(
         schema_name=schema_name,
         table_name=table_name,
-        columns=column_info,
-        primary_key=primary_key.get("constrained_columns", []),
-        foreign_keys=foreign_key_info,
+        columns=columns,
+        primary_key=list(details.get("primary_key", details.get("primary_keys", []))),
+        foreign_keys=foreign_keys,
     )
 
 
-if __name__ == "__main__":
-    table = get_table_metadata("gene", "gene")
-
-    context = SchemaContext(
-        tables=[table]
-    )
-
-    print(context.model_dump_json(indent=2))
+def get_schema_context(adapter: DatabaseAdapter) -> SchemaContext:
+    tables = []
+    for schema in adapter.get_schemas():
+        for table in adapter.get_tables(schema=schema):
+            tables.append(get_table_metadata(adapter, schema, table))
+    return SchemaContext(tables=tables)

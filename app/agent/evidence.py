@@ -13,6 +13,7 @@ class Evidence:
     logical_reason: str
     confidence: float
     depends_on: list[int] = field(default_factory=list)
+    pagination_complete: bool = False
 
 
 @dataclass

@@ -96,7 +96,7 @@ class LogicalVerifier:
         asks_top_results = self._asks_for_top_results(intent_text)
 
         ranking_validation = self._validate_ranking(
-            intent_text,
+            f"{question_text} {objective_text}",
             sql_text,
         )
 
@@ -1047,6 +1047,20 @@ Determine whether the result is relevant.
                 ),
             }
 
+        if "," not in order_clause:
+            return {
+                "valid": False,
+                "reason": (
+                    "The ranking has no deterministic secondary ordering "
+                    "for tied metric values."
+                ),
+                "missing": "A stable entity tie-breaker in ORDER BY.",
+                "revision": (
+                    f"Add a stable entity tie-breaker after "
+                    f"{expected_direction}, such as <entity_name> ASC."
+                ),
+            }
+
         top_n_match = re.search(
             r"\btop\s+(\d+)\b",
             question,
@@ -1090,6 +1104,31 @@ Determine whether the result is relevant.
                     ),
                     "revision": (
                         f"Change the query to LIMIT {requested_n}"
+                    ),
+                }
+
+        elif (
+            re.search(r"\bwhich\b", question)
+            and re.search(r"\b(?:in each|across|for each|per)\b", question)
+            and re.search(r"\b(?:most|highest|largest|maximum|least|lowest|smallest|minimum)\b", question)
+        ):
+            limit_match = re.search(
+                r"\blimit\s+(\d+)\b",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            if not limit_match or int(limit_match.group(1)) != 100:
+                return {
+                    "valid": False,
+                    "reason": (
+                        "The question requests a ranked comparison across "
+                        "the grouped entities without specifying a Top-N. "
+                        "Return the complete ranked result within the "
+                        "system row cap using LIMIT 100."
+                    ),
+                    "missing": "Complete ranked group coverage (LIMIT 100).",
+                    "revision": (
+                        "Use LIMIT 100 and retain the requested ranking order."
                     ),
                 }
 

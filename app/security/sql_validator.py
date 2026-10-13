@@ -26,7 +26,9 @@ class SQLSecurityValidator:
         allowed_tables: set[tuple[str, str]],
         blocked_columns: set[tuple[str, str, str]] | None = None,
         schema_context: list[dict[str, Any]] | None = None,
+        dialect: str = "postgres",
     ):
+        self.dialect = dialect
         self.allowed_tables = {
             (
                 str(schema).lower(),
@@ -265,7 +267,7 @@ class SQLSecurityValidator:
 
             statements = sqlglot.parse(
                 sql,
-                read="postgres",
+                read=self.dialect,
             )
 
         except Exception as error:
@@ -292,6 +294,12 @@ class SQLSecurityValidator:
             return SQLValidationResult(
                 False,
                 "Only SELECT statements are allowed.",
+            )
+
+        if statement.args.get("into") is not None:
+            return SQLValidationResult(
+                False,
+                "SELECT INTO is not allowed because it writes database objects.",
             )
 
         forbidden_expressions = (
@@ -375,6 +383,24 @@ class SQLSecurityValidator:
                         f"Table '{schema}.{table.name}' "
                         "is not permitted for this investigation."
                     ),
+                )
+
+        selected_star = any(
+                isinstance(projection, expressions.Star)
+                or projection.find(expressions.Star) is not None
+                for projection in statement.expressions
+        )
+        selected_aggregate = any(
+                projection.find(expressions.AggFunc) is not None
+                for projection in statement.expressions
+        )
+        has_source_column = statement.find(
+                expressions.Column
+        ) is not None
+        if not (selected_star or selected_aggregate or has_source_column):
+                return SQLValidationResult(
+                    False,
+                    "SELECT result is not derived from any database column.",
                 )
 
         relation_map: dict[

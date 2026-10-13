@@ -83,11 +83,21 @@ class GroqProvider(LLMProvider):
             )
         except Exception as error:
             error_text = self._extract_error_text(error)
+            schema_rejected = (
+                "json_validate_failed" in error_text
+                or "failed to validate json" in error_text
+                or "invalid json schema for response_format" in error_text
+                or (
+                    "response_format" in error_text
+                    and "required" in error_text
+                    and "schema" in error_text
+                )
+            )
 
             # Some Groq models expose JSON mode but reject strict JSON
             # schemas for particular Pydantic constructs. Fall back to
             # generic JSON mode before declaring the model unusable.
-            if "json_validate_failed" not in error_text and "failed to validate json" not in error_text:
+            if not schema_rejected:
                 logger.warning("Groq request failed model=%s error=%s", model, error)
                 raise
 

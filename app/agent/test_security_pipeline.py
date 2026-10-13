@@ -3,6 +3,49 @@ from app.database.manager import DatabaseManager
 from app.security.sql_validator import SQLSecurityValidator
 
 
+def test_validator_rejects_placeholder_projection_without_database_data():
+    validator = SQLSecurityValidator(
+        allowed_tables={("public", "observations")},
+        schema_context=[{
+            "schema": "public",
+            "table": "observations",
+            "columns": [{"name": "country"}],
+        }],
+    )
+
+    result = validator.validate(
+        "SELECT DISTINCT 'No gene information available' AS result "
+        "FROM public.observations LIMIT 1"
+    )
+
+    assert not result.allowed
+    assert "not derived from any database column" in result.reason
+
+
+def test_validator_allows_column_aggregate_and_row_queries():
+    validator = SQLSecurityValidator(
+        allowed_tables={("public", "observations")},
+        schema_context=[{
+            "schema": "public",
+            "table": "observations",
+            "columns": [
+                {"name": "country"},
+                {"name": "id"},
+            ],
+        }],
+    )
+
+    assert validator.validate(
+        "SELECT country FROM public.observations LIMIT 100"
+    ).allowed
+    assert validator.validate(
+        "SELECT COUNT(*) FROM public.observations LIMIT 1"
+    ).allowed
+    assert validator.validate(
+        "SELECT * FROM public.observations LIMIT 100"
+    ).allowed
+
+
 def main():
 
     connection = DatabaseConnection(

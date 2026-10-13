@@ -14,6 +14,12 @@ class Evidence:
     confidence: float
     depends_on: list[int] = field(default_factory=list)
     pagination_complete: bool = False
+    total_rows: int | None = None
+    all_extreme_ties: bool = False
+    ranking_metric: str | None = None
+    requested_periods: list[int] = field(default_factory=list)
+    observed_periods: list[int] = field(default_factory=list)
+    unavailable_periods: list[int] = field(default_factory=list)
 
 
 @dataclass

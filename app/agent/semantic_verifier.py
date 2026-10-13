@@ -23,6 +23,7 @@ class SemanticResultVerifier:
         sql: str,
         rows: list[dict[str, Any]],
         schema_context: list[dict],
+        dialect: str = "postgres",
     ) -> SemanticVerificationResult:
 
         checks: list[str] = []
@@ -52,7 +53,7 @@ class SemanticResultVerifier:
         try:
             statements = sqlglot.parse(
                 sql,
-                read="postgres",
+                read=dialect,
             )
 
         except Exception as error:

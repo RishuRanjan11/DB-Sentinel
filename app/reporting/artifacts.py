@@ -50,7 +50,7 @@ def build_artifacts(question: str, insight: dict | None, evidence: list[dict]) -
         title=question,
         executive_summary=summary,
         findings=findings,
-        recommendations=[],
+        recommendations=list(insight.get("recommendations") or []),
         uncertainties=uncertainties,
         evidence=evidence,
     )

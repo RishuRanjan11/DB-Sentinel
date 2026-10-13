@@ -159,7 +159,7 @@ class RequestPolicy:
             ),
             (
                 "UPDATE",
-                r"\b(update|modify|change)\s+(?:the\s+)?(?:table|column|schema|database|record|row|data)\b|\bset\s+[A-Za-z_][A-Za-z0-9_.]*\s*="
+                r"\bupdate\s+(?:(?:the|a|an)\s+)?(?:[\w.-]+\s+){0,3}(?:table|column|schema|database|record|row|data)\b|\b(modify|change)\s+(?:the\s+)?(?:table|column|schema|database|record|row|data)\b|\bset\s+[A-Za-z_][A-Za-z0-9_.]*\s*="
             ),
             (
                 "ALTER",

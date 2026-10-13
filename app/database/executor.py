@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any
 
 from app.database.adapters.base import DatabaseAdapter
@@ -26,6 +28,7 @@ class SecureQueryExecutor:
         validator: SQLSecurityValidator,
         statement_timeout_ms: int = DEFAULT_TIMEOUT_MS,
         max_rows: int = MAX_ROWS,
+        audit_context: dict[str, str] | None = None,
     ):
         if statement_timeout_ms <= 0:
             raise ValueError(
@@ -42,10 +45,15 @@ class SecureQueryExecutor:
         self.validator = validator
         self.statement_timeout_ms = statement_timeout_ms
         self.max_rows = max_rows
+        self.audit_context = {
+            key: value
+            for key, value in (audit_context or {}).items()
+            if value
+        }
 
     def execute(
         self,
-        sql: str,
+        sql: Any,
         parameters: dict[str, Any] | None = None,
     ) -> QueryExecutionResult:
 
@@ -60,6 +68,7 @@ class SecureQueryExecutor:
                 event="QUERY_REJECTED",
                 sql=sql,
                 reason=validation.reason,
+                audit_context=self.audit_context,
             )
 
             return QueryExecutionResult(
@@ -86,6 +95,7 @@ class SecureQueryExecutor:
                 event="QUERY_EXECUTED",
                 sql=sql,
                 reason="Query executed successfully.",
+                audit_context=self.audit_context,
             )
 
             return QueryExecutionResult(
@@ -102,6 +112,7 @@ class SecureQueryExecutor:
                 event="QUERY_FAILED",
                 sql=sql,
                 reason=str(error),
+                audit_context=self.audit_context,
             )
 
             return QueryExecutionResult(
@@ -115,17 +126,32 @@ class SecureQueryExecutor:
     @staticmethod
     def _audit(
         event: str,
-        sql: str,
+        sql: Any,
         reason: str,
+        audit_context: dict[str, str] | None = None,
     ) -> None:
 
         # Prototype audit trail.
         # Persistent tenant-aware audit storage will be added
         # when the SaaS persistence layer is implemented.
 
+        query_text = (
+            sql
+            if isinstance(sql, str)
+            else json.dumps(sql, ensure_ascii=True, sort_keys=True)
+        )
+        query_text = " ".join(query_text.split())
+        query_hash = hashlib.sha256(
+            query_text.strip().encode("utf-8")
+        ).hexdigest()[:16]
         logger.info(
-            "AUDIT event=%s reason=%s sql=%s",
+            "AUDIT event=%s organization_id=%s workspace_id=%s "
+            "connection_id=%s reason=%s query_sha256=%s query=%s",
             event,
+            (audit_context or {}).get("organization_id", "unspecified"),
+            (audit_context or {}).get("workspace_id", "unspecified"),
+            (audit_context or {}).get("connection_id", "unspecified"),
             reason,
-            sql.strip(),
+            query_hash,
+            query_text,
         )

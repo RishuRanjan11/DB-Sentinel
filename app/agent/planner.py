@@ -7,6 +7,7 @@ from app.llm.model_router import (
     ModelRouter,
     create_default_model_router,
 )
+from app.agent.question_normalizer import QuestionNormalizer
 
 
 class SubQuestion(BaseModel):
@@ -25,6 +26,8 @@ class SubQuestion(BaseModel):
     depends_on: List[int] = Field(
         default_factory=list
     )
+
+    optional: bool = False
 
 
 class InvestigationPlan(BaseModel):
@@ -48,18 +51,297 @@ class QuestionPlanner:
             or create_default_model_router()
         )
 
+    @staticmethod
+    def _direct_ranking_plan(
+        question: str,
+        original_question: str,
+    ) -> InvestigationPlan:
+        asks_minimum = bool(
+            re.search(
+                r"\b(?:least|lowest|smallest|minimum|min)\b",
+                original_question,
+                re.IGNORECASE,
+            )
+        )
+        extreme = "minimum" if asks_minimum else "maximum"
+        direction = (
+            "lowest to highest"
+            if asks_minimum
+            else "highest to lowest"
+        )
+        top_n = QuestionPlanner._extract_top_n(original_question.lower())
+        contrast_match = re.search(
+            r"\b(?:but|while|whereas|yet|although|despite)\b",
+            original_question,
+            re.IGNORECASE,
+        )
+        contrastive = False
+        if contrast_match:
+            clauses = (
+                original_question[:contrast_match.start()],
+                original_question[contrast_match.end():],
+            )
+            high_pattern = (
+                r"\b(?:most|highest|largest|maximum|max|more|greater|high|higher)\b"
+            )
+            low_pattern = (
+                r"\b(?:low|lower|lowest|least|smallest|minimum|min|less|fewer)\b"
+            )
+            first, second = clauses
+            contrastive = bool(
+                re.search(high_pattern, first, re.I)
+                and re.search(low_pattern, second, re.I)
+                or re.search(low_pattern, first, re.I)
+                and re.search(high_pattern, second, re.I)
+            )
+        if contrastive:
+            objective = (
+                "Directly answer the original multi-measure contrast in one "
+                "database operation. For each requested entity, return every "
+                "measure explicitly requested in the original question, "
+                "keeping each measure associated with the same entity. "
+                "Preserve the requested high/low relationship; do not reduce "
+                "the request to a ranking by only one measure. Return all "
+                "entities needed to compare the measures, and do not impose "
+                "an arbitrary result limit. Use the median across the "
+                "returned entities as the relative benchmark when the user "
+                "has not specified another benchmark. Rank using the measure "
+                "the question describes as high."
+            )
+        else:
+            objective = (
+                "Directly answer the original ranking request in one database "
+                "operation. Rank the requested entities from "
+                f"{direction} by the metric requested by the user and return "
+                "that metric value for each ranked entity."
+            )
+        if top_n is not None:
+            objective += f" Return exactly the top {top_n} results."
+        elif not contrastive and re.search(
+            r"\b(?:most|highest|largest|maximum|max|least|lowest|smallest|minimum|min)\b",
+            original_question,
+            re.IGNORECASE,
+        ):
+            objective += (
+                f" Return all entities tied at the requested {extreme}; "
+                "do not select an arbitrary single entity when multiple "
+                "entities share the extreme value."
+            )
+
+        return InvestigationPlan(
+            original_question=original_question,
+            goal=original_question,
+            sub_questions=[
+                SubQuestion(
+                    id=1,
+                    question=question,
+                    objective=objective,
+                    required_information=[
+                        original_question,
+                        (
+                            "entity names and every measure required to "
+                            "evaluate the requested relative comparison"
+                            if contrastive
+                            else "entity names and the requested ranking metric"
+                        ),
+                    ],
+                    depends_on=[],
+                )
+            ],
+        )
+
     def create_plan(
         self,
         question: str,
         conversation_history: list[dict] | None = None,
+        authoritative_question: str | None = None,
     ) -> InvestigationPlan:
 
         question = question.strip()
+        original_question = (authoritative_question or question).strip()
 
         if not question:
             raise ValueError(
                 "Question cannot be empty."
             )
+
+        if self._is_simple_count_lookup(original_question):
+            plan = InvestigationPlan(
+                original_question=original_question,
+                goal=original_question,
+                sub_questions=[
+                    SubQuestion(
+                        id=1,
+                        question=question,
+                        objective=(
+                            "Return the requested count for the user's "
+                            "stated filters as a single aggregate result. "
+                            "Do not add comparisons or segment analyses "
+                            "unless the user asks for them."
+                        ),
+                        required_information=[original_question],
+                        depends_on=[],
+                    )
+                ],
+            )
+            if self._asks_why(original_question):
+                self._sanitize_why_plan(
+                    original_question,
+                    plan,
+                )
+            self._validate_and_normalize_dependencies(plan)
+            return plan
+
+        relative_years = QuestionNormalizer.relative_calendar_years(
+            original_question
+        )
+        if (
+            relative_years
+            and self._asks_for_period_comparison(original_question)
+        ):
+            years = relative_years
+            plan = InvestigationPlan(
+                original_question=original_question,
+                goal=original_question,
+                sub_questions=[
+                    SubQuestion(
+                        id=1,
+                        question=question,
+                        objective=(
+                            "Return the requested metric as one raw value "
+                            "per calendar year for the inclusive requested "
+                            f"range {years[0]} through {years[-1]}. Include "
+                            "each year label and its value in separate "
+                            "result rows. Do not collapse the yearly rows "
+                            "into a calculated summary; derive growth or "
+                            "change from the verified annual values."
+                        ),
+                        required_information=[
+                            "The raw requested metric for every calendar "
+                            "year in the inclusive requested range",
+                            "A separate year label and metric value per row",
+                            *(f"Year {year}" for year in years),
+                        ],
+                        depends_on=[],
+                    )
+                ],
+            )
+            if self._asks_why(original_question):
+                self._sanitize_why_plan(
+                    original_question,
+                    plan,
+                )
+            self._validate_and_normalize_dependencies(plan)
+            return plan
+
+        relative_duration = (
+            QuestionNormalizer.relative_comparison_year_count(
+                original_question
+            )
+        )
+        if (
+            relative_duration
+            and not relative_years
+            and self._asks_for_period_comparison(original_question)
+        ):
+            plan = InvestigationPlan(
+                original_question=original_question,
+                goal=original_question,
+                sub_questions=[
+                    SubQuestion(
+                        id=1,
+                        question=question,
+                        objective=(
+                            "Return the requested metric as one raw value "
+                            f"for each of the {relative_duration} most recent "
+                            "distinct calendar years present in the database. "
+                            "Determine the years from the data, group by "
+                            "calendar year, sort the year values descending, "
+                            f"and return the latest {relative_duration} annual "
+                            "rows. Do not use the current system date or "
+                            "assume a specific year range; do not filter to "
+                            "years that are not present in the database. "
+                            "If the original question requests an entity or "
+                            "dimension breakdown, group by that dimension and "
+                            "calendar year and return one row per "
+                            "entity/year; do not limit the result to the "
+                            "number of years, since that would omit entities. "
+                            "Otherwise return one year label and its raw "
+                            "metric value per row. Preserve all groups needed "
+                            "to derive the requested trend from verified "
+                            "values."
+                        ),
+                        required_information=[
+                            original_question,
+                            (
+                                f"Raw requested metric values for the "
+                                f"{relative_duration} latest distinct years "
+                                "available in the database"
+                            ),
+                            "A separate calendar-year label and raw metric "
+                            "value for each returned year",
+                        ],
+                        depends_on=[],
+                    )
+                ],
+            )
+            if self._asks_why(original_question):
+                self._sanitize_why_plan(
+                    original_question,
+                    plan,
+                )
+            self._validate_and_normalize_dependencies(plan)
+            return plan
+
+        if self._has_explicit_year_comparison(original_question):
+            years = self._explicit_years(original_question)
+            plan = InvestigationPlan(
+                original_question=original_question,
+                goal=original_question,
+                sub_questions=[
+                    SubQuestion(
+                        id=1,
+                        question=question,
+                        objective=(
+                            "Return the requested metric grouped by each "
+                            f"explicitly requested year ({years[0]} and "
+                            f"{years[1]}) so the values can be compared. "
+                            "Return one result row per year containing the "
+                            "year and its raw requested metric value. Do not "
+                            "collapse the yearly rows into a single percentage, "
+                            "difference, or other calculated summary; derive "
+                            "those from the verified yearly values afterward. "
+                            "If a year has no matching records, preserve "
+                            "that as missing-period evidence; do not replace "
+                            "the requested years with the latest available "
+                            "years."
+                        ),
+                        required_information=[
+                            "One raw requested-metric value and year label "
+                            "for each requested period",
+                            "A separate result row for each requested year",
+                            f"Year {years[0]}",
+                            f"Year {years[1]}",
+                        ],
+                        depends_on=[],
+                    )
+                ],
+            )
+            if self._asks_why(original_question):
+                self._sanitize_why_plan(
+                    original_question,
+                    plan,
+                )
+            self._validate_and_normalize_dependencies(plan)
+            return plan
+
+        if self._is_direct_ranking_lookup(original_question):
+            plan = self._direct_ranking_plan(
+                question=question,
+                original_question=original_question,
+            )
+            self._validate_and_normalize_dependencies(plan)
+            return plan
 
         system_instruction = """
 You are the investigation planner for DB-Sentinel.
@@ -96,10 +378,10 @@ The planner does NOT know the database schema.
 Therefore you MUST NOT assume that the database contains:
 
 - functional categories
-- gene types
-- biological functions
-- conservation scores
-- expression levels
+- entity classifications
+- related-record categories
+- quality or status scores
+- measured values
 - disease categories
 - timestamps
 - geographic dimensions
@@ -115,39 +397,8 @@ For a "why" question, do NOT invent a possible explanation.
 Instead, identify measurable evidence that can be used to
 compare the entities involved.
 
-For example:
-
-User:
-"Why do some pathways have more human-ortholog mappings than others?"
-
-BAD:
-"Analyze the distribution of gene types or functional categories
-within pathways."
-
-BAD:
-"Compare evolutionary conservation levels between pathways."
-
-BAD:
-"Determine whether pathway function explains the difference."
-
-These are invalid because the planner has no schema knowledge
-and the user did not request those dimensions.
-
-GOOD:
-"Compare the number of FlyBase genes and the number of
-FlyBase genes with human-ortholog mappings across pathways."
-
-GOOD:
-"Measure the proportion of pathway-member genes that have
-human-ortholog mappings and compare that proportion across
-pathways."
-
-GOOD:
-"Identify measurable pathway-level differences in gene
-membership and human-ortholog coverage."
-
-The later schema-retrieval and SQL-generation layers determine
-which of these measurements can actually be answered.
+The later schema-retrieval and query-generation layers determine
+which requested measurements and relationships can actually be answered.
 
 If the database cannot provide evidence for a proposed
 explanation, DB-Sentinel should report that limitation instead
@@ -308,6 +559,23 @@ Rules:
 17. Do not create a generic intermediate step that loses the
     final analytical requirement.
 
+18. Treat dates, years, and ranges as filters when they constrain the
+     requested records or metric. Do not add trend, prior-period, or
+     segment-comparison work unless the user explicitly asks for that
+     analysis.
+
+19. Do not assume that a value decreased or that any factor caused a
+     change. First compare verified measurements. Describe contributors
+     as associations unless the evidence supports causation.
+
+20. Choose useful dimensions from the user's wording and discovered
+     schema. Do not assume specific columns or invent database fields.
+     If no suitable dimension is available, report that limitation.
+
+21. When the user explicitly asks for period or segment comparisons,
+     use only dimensions confirmed by live schema metadata. Treat
+     measured differences as associations, not causes.
+
 ============================================================
 WHY-QUESTION DESIGN
 ============================================================
@@ -328,63 +596,34 @@ relationships that could explain the observed difference.
 Do NOT create a step that requires an unspecified scientific,
 business, or domain explanation.
 
-For example:
-
-Question:
-"Why do some pathways have more human-ortholog mappings than others?"
-
-Preferred plan:
-
-Step 1:
-"Measure the number of FlyBase genes and FlyBase genes with
-human-ortholog mappings for each pathway."
-
-Step 2:
-"Compare human-ortholog coverage across pathways by measuring
-the proportion of pathway-member genes that have human-ortholog
-mappings."
-
-Step 3:
-"Compare pathway membership and human-ortholog mapping patterns
-to identify measurable differences associated with the observed
-mapping counts."
-
-NOT:
-
-"Analyze gene functional categories."
-
-NOT:
-
-"Analyze evolutionary conservation."
-
-NOT:
-
-"Determine which biological functions cause the difference."
+Use only dimensions stated in the question or justified by verified
+schema metadata. Never invent an entity type, category, measure, or
+causal mechanism.
 
 ============================================================
 IMPORTANT RANKING EXAMPLE
 ============================================================
 
-User:
-
-"Which pathways contain the most FlyBase genes with human
-orthologs, and how many are in each?"
+For a request such as "Which groups contain the most related records,
+and how many are in each?", preserve all three requirements:
+identify the requested groups, count the requested related entities per
+group, and rank groups by that count.
 
 Valid decomposition:
 
 Step 1:
-"Identify FlyBase genes that have human orthologs."
+"Identify the entities and relationships required by the user."
 
 Step 2:
-"Determine the pathways associated with those FlyBase genes."
+"Retrieve the requested group-to-entity relationships."
 
 Step 3:
-"Count the FlyBase genes with human orthologs in each pathway
-and rank the pathways from highest to lowest count."
+"Count the requested entities in each group and rank the groups from
+highest to lowest count."
 
 The final analytical requirement must never be reduced to:
 
-"Count genes by pathway."
+"Count records by group."
 
 ============================================================
 OUTPUT
@@ -403,6 +642,9 @@ Return structured output only.
 Create an investigation plan for the following ORIGINAL
 USER QUESTION:
 
+{original_question}
+
+Clear, grammar-corrected interpretation for query planning:
 {question}
 
 CONVERSATION CONTEXT:
@@ -413,6 +655,12 @@ Use previous conversation context only to resolve references such as
 references. The current user question remains authoritative.
 
 The original question is authoritative.
+
+When a ranking request contrasts measures (for example, one measure is high
+while another is low), preserve both measures and their relationship. Do not
+reduce it to a ranking on only one measure; request the values needed to make
+the comparison explicit. Keep all requested measures in one step when one
+grouped result can answer the comparison.
 
 Before generating the plan, identify internally:
 
@@ -448,6 +696,11 @@ scientific, or technical explanations.
 
 Every step must contribute evidence toward answering the
 original question.
+
+Treat time ranges as filters unless the user explicitly requests
+a comparison, trend, or change analysis. Do not add supplemental
+period or dimension analyses merely because the question includes
+a date or year.
 """
 
         plan = self.model_router.generate(
@@ -455,77 +708,31 @@ original question.
             user_prompt=user_prompt,
             response_model=InvestigationPlan,
             complexity="fast",
-            classification_text=question,
+            classification_text=original_question,
         )
 
+        plan.original_question = original_question
+        plan.goal = original_question
+        self._remove_unrequested_period_context(original_question, plan)
         self._validate_and_normalize_dependencies(
             plan
         )
 
         # ==================================================
-        # DIRECT RANKING NORMALIZATION
-        # ==================================================
-        #
-        # A request such as:
-        #   "Which pathways contain the most X, and how many are in each?"
-        # is already a complete analytical request. It does not need
-        # a prerequisite "find pathways" step followed by a ranking
-        # step. Keeping it as one step prevents intermediate row-level
-        # duplicates from becoming a false verification failure.
-        #
-        # Comparison questions (for example Q5) are intentionally NOT
-        # normalized here; they retain their multi-step investigation.
-        # ==================================================
-
-        if self._is_direct_ranking_lookup(question):
-
-            top_n = self._extract_top_n(question.lower())
-            ranking_text = (
-                "Rank the requested entities from highest to lowest by "
-                "the metric requested by the user and return the metric "
-                "value for each ranked entity."
-            )
-
-            if top_n is not None:
-                ranking_text += (
-                    f" Return exactly the top {top_n} results."
-                )
-
-            plan = InvestigationPlan(
-                original_question=question,
-                goal=question,
-                sub_questions=[
-                    SubQuestion(
-                        id=1,
-                        question=question,
-                        objective=(
-                            "Directly answer the original ranking "
-                            "request in one database operation. "
-                            + ranking_text
-                        ),
-                        required_information=[
-                            question,
-                            "entity names and the requested ranking metric",
-                        ],
-                        depends_on=[],
-                    )
-                ],
-            )
-
-        # ==================================================
         # DIRECT LOOKUP NORMALIZATION
         # ==================================================
         # ==================================================
         # DIRECT LOOKUP NORMALIZATION
         # ==================================================
 
-        if self._is_direct_lookup(
-            question
+        if (
+            self._is_direct_lookup(original_question)
+            and not self._has_explicit_time_period(original_question)
         ):
 
             plan = InvestigationPlan(
-                original_question=question,
-                goal=question,
+                original_question=original_question,
+                goal=original_question,
                 sub_questions=[
                     SubQuestion(
                         id=1,
@@ -535,7 +742,7 @@ original question.
                             "to answer the original user question."
                         ),
                         required_information=[
-                            question
+                            original_question
                         ],
                         depends_on=[],
                     )
@@ -563,13 +770,13 @@ original question.
         # objective.
         # ==================================================
 
-        verification_core = self._extract_verification_core(question)
+        verification_core = self._extract_verification_core(original_question)
 
         if verification_core is not None:
 
             plan = InvestigationPlan(
-                original_question=question,
-                goal=question,
+                original_question=original_question,
+                goal=original_question,
                 sub_questions=[
                     SubQuestion(
                         id=1,
@@ -604,11 +811,11 @@ original question.
         # ==================================================
 
         if self._asks_why(
-            question
+            original_question
         ):
 
             plan = self._sanitize_why_plan(
-                question=question,
+                question=original_question,
                 plan=plan,
             )
 
@@ -616,7 +823,7 @@ original question.
         # RANKING INTENT PRESERVATION
         # ==================================================
 
-        original_lower = question.lower()
+        original_lower = original_question.lower()
 
         ranking_terms = {
             "most",
@@ -708,11 +915,197 @@ original question.
                         f" Return only the top {top_n} ranked results."
                     )
 
+        plan = self._normalize_period_scoped_plan(
+            original_question,
+            plan,
+        )
+
         self._validate_and_normalize_dependencies(
             plan
         )
 
         return plan
+
+    @classmethod
+    def _normalize_period_scoped_plan(
+        cls,
+        question: str,
+        plan: InvestigationPlan,
+    ) -> InvestigationPlan:
+        if (
+            not cls._has_explicit_time_period(question)
+            or not cls._asks_for_period_comparison(question)
+        ):
+            return plan
+
+        measure_text = " ".join(
+            [
+                question,
+                *(f"{step.question} {step.objective}" for step in plan.sub_questions),
+            ]
+        )
+        if not re.search(
+            r"\b(?:metric|measure|total|sum|average|mean|amount|quantity|"
+            r"volume|count|number|value|rate|sales|revenue|calculate|"
+            r"aggregate|how many)\b",
+            measure_text,
+            re.IGNORECASE,
+        ):
+            return plan
+
+        required_steps = [
+            step for step in plan.sub_questions if not step.optional
+        ]
+        if not required_steps:
+            return plan
+        baseline = required_steps[0]
+
+        comparison = next(
+            (
+                step
+                for step in plan.sub_questions
+                if step.optional
+                and re.search(
+                    r"\b(?:previous|prior|preceding|compare|comparison)\b",
+                    f"{step.question} {step.objective}",
+                    re.IGNORECASE,
+                )
+            ),
+            None,
+        )
+        if comparison is None:
+            comparison = SubQuestion(
+                id=max(step.id for step in plan.sub_questions) + 1,
+                question=(
+                    "Compare the requested metric for the requested "
+                    "period with the immediately preceding comparable "
+                    "period."
+                ),
+                objective=(
+                    "Measure the period-to-period difference, comparing "
+                    "corresponding calendar or fiscal periods when the "
+                    "data supports that comparison."
+                ),
+                depends_on=[baseline.id],
+                optional=True,
+            )
+            plan.sub_questions.append(comparison)
+        else:
+            comparison.depends_on = [baseline.id]
+            comparison.optional = True
+            comparison.objective = (
+                f"{comparison.objective} Compare corresponding calendar "
+                "or fiscal periods when the data supports that comparison."
+            )
+
+        segment_steps = [
+            step
+            for step in plan.sub_questions
+            if step.optional
+            and step.id != comparison.id
+            and re.search(
+                r"\b(?:breakdown|broken down|segment|category|categories|"
+                r"product|geograph|region|customer|channel|dimension)\b",
+                f"{step.question} {step.objective}",
+                re.IGNORECASE,
+            )
+        ]
+        if not segment_steps:
+            segment_steps = [
+                SubQuestion(
+                    id=max(step.id for step in plan.sub_questions) + 1,
+                    question=(
+                        "Break down the requested metric by relevant "
+                        "dimensions available in the database."
+                    ),
+                    objective=(
+                        "Identify measurable segments associated with "
+                        "the period-to-period difference, using only "
+                        "dimensions present in live schema metadata."
+                    ),
+                    optional=True,
+                )
+            ]
+            plan.sub_questions.extend(segment_steps)
+
+        for step in segment_steps:
+            if not re.search(
+                r"\b(?:previous|prior|preceding|compare|comparison)\b",
+                step.question,
+                re.IGNORECASE,
+            ):
+                step.question = (
+                    f"{step.question.rstrip('.')} and compare the same "
+                    "breakdown with the immediately preceding comparable "
+                    "period."
+                )
+            step.objective = (
+                f"{step.objective} Identify segments with the largest "
+                "verified differences across corresponding periods; "
+                "describe association, not causation."
+            )
+            step.depends_on = [baseline.id, comparison.id]
+            step.optional = True
+
+        return plan
+
+    @classmethod
+    def _remove_unrequested_period_context(
+        cls,
+        question: str,
+        plan: InvestigationPlan,
+    ) -> None:
+        if cls._asks_for_period_comparison(question):
+            return
+
+        period_context_patterns = (
+            r"\b(?:previous|prior|preceding)\s+(?:comparable\s+)?period\b",
+            r"\bperiod[- ]to[- ]period\b",
+            r"\bcompare\s+(?:the\s+)?same\s+breakdown\b",
+            r"\bcorresponding\s+(?:calendar|fiscal)\s+periods?\b",
+            r"\bsegments?\s+with\s+the\s+largest\s+"
+            r"(?:verified|measured)\s+differences\b",
+        )
+        removed_ids = {
+            step.id
+            for step in plan.sub_questions
+            if step.optional
+            and any(
+                re.search(
+                    pattern,
+                    f"{step.question} {step.objective}",
+                    re.IGNORECASE,
+                )
+                for pattern in period_context_patterns
+            )
+        }
+        if not removed_ids:
+            return
+
+        retained = [
+            step
+            for step in plan.sub_questions
+            if step.id not in removed_ids
+        ]
+        for step in retained:
+            step.depends_on = [
+                dependency
+                for dependency in step.depends_on
+                if dependency not in removed_ids
+            ]
+        plan.sub_questions = retained
+
+    @staticmethod
+    def _asks_for_period_comparison(question: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:compare|compared|comparison|versus|vs\.?|"
+                r"difference|trend|change|increase|increased|"
+                r"decrease|decreased|growth|decline)\b",
+                question or "",
+                re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _extract_verification_core(question: str) -> str | None:
@@ -748,8 +1141,49 @@ original question.
 
         return bool(
             re.search(
-                r"\bwhy\b",
+                r"\b(?:why|reason|reasons|explain|explanation|cause|"
+                r"causes|caused|driver|drivers|factor|factors|"
+                r"contributor|contributors|contributed)\b",
                 question,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _explicit_years(question: str) -> list[int]:
+        return sorted({
+            int(year)
+            for year in re.findall(r"\b(?:19|20)\d{2}\b", question or "")
+        })
+
+    @classmethod
+    def _has_explicit_year_comparison(cls, question: str) -> bool:
+        return (
+            len(cls._explicit_years(question)) == 2
+            and bool(
+                re.search(
+                    r"\b(?:compare|comparison|versus|vs\.?|against|"
+                    r"increase|increased|increasing|decrease|decreased|"
+                    r"decreasing|higher|lower|change|changed|changing|"
+                    r"difference|delta|trend|growth|grow|decline|declined)\b",
+                    question or "",
+                    re.IGNORECASE,
+                )
+            )
+        )
+
+    @staticmethod
+    def _has_explicit_time_period(question: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:"
+                r"january|february|march|april|may|june|july|august|"
+                r"september|october|november|december|"
+                r"q[1-4]|quarter|"
+                r"today|yesterday|week|month|quarter|year|"
+                r"last|previous|prior|current|this|past|next"
+                r")\b|\b\d{4}(?:-\d{2}(?:-\d{2})?)?\b",
+                question or "",
                 re.IGNORECASE,
             )
         )
@@ -770,22 +1204,12 @@ original question.
         but not speculative domain-specific explanations.
         """
 
-        forbidden_patterns = [
-            r"\bfunctional categories?\b",
-            r"\bfunctional category\b",
-            r"\bgene types?\b",
-            r"\btypes? of genes\b",
-            r"\bevolutionary conservation\b",
-            r"\bconservation level\b",
-            r"\bexpression levels?\b",
-            r"\bdisease categories?\b",
-            r"\bbiological functions?\b",
-            r"\bbiological pathways?\b",
-            r"\bcausal factors?\b",
+        unsupported_causal_patterns = [
             r"\bcauses?\b",
-            r"\broot causes?\b",
-            r"\bexplain(?:s|ed)? by\b",
-            r"\bdriv(?:e|es|en)\b",
+            r"\bcaused by\b",
+            r"\bdrives?\b",
+            r"\bdriven by\b",
+            r"\bleads? to\b",
             r"\bresponsible for\b",
         ]
 
@@ -801,51 +1225,28 @@ original question.
                 f"{' '.join(step.required_information)}"
             )
 
-            speculative = any(
+            unsupported_causal_claim = any(
                 re.search(
                     pattern,
                     combined,
                     re.IGNORECASE,
                 )
-                for pattern in forbidden_patterns
+                for pattern in unsupported_causal_patterns
             )
 
-            if speculative:
-
-                # Replace speculative analytical steps with a
-                # schema-agnostic measurable comparison.
-                replacement_question = (
-                    "Compare measurable pathway-level differences "
-                    "directly related to the observed human-ortholog "
-                    "mapping counts."
-                )
-
-                replacement_objective = (
-                    "Identify measurable differences in pathway "
-                    "membership and human-ortholog coverage that "
-                    "are supported by the available database schema. "
-                    "Do not assume an explanatory variable that is "
-                    "not represented in the database."
-                )
-
-                required_information = [
-                    "pathway-level gene membership",
-                    "FlyBase gene counts",
-                    "human-ortholog mapping counts",
-                    "human-ortholog coverage",
-                ]
-
+            if unsupported_causal_claim:
                 step.question = (
-                    replacement_question
+                    "Compare the measurements, entities, and dimensions "
+                    "requested by the user to identify evidence-supported "
+                    "differences associated with the outcome."
                 )
-
                 step.objective = (
-                    replacement_objective
+                    "Report measurable associations relevant to the user's "
+                    "question without asserting an unsupported causal "
+                    "relationship."
                 )
-
-                step.required_information = (
-                    required_information
-                )
+                step.required_information = [question]
+                step.optional = True
 
             cleaned_steps.append(
                 step
@@ -882,19 +1283,16 @@ original question.
             baseline = SubQuestion(
                 id=next_id,
                 question=(
-                    "Measure the relevant pathway-level "
-                    "human-ortholog mapping counts and the "
-                    "corresponding pathway gene membership."
+                    "Measure the metric and entities named in the "
+                    "original question, preserving its filters, to "
+                    "establish an evidence baseline."
                 ),
                 objective=(
-                    "Establish the measurable baseline needed "
-                    "to compare pathways with different numbers "
-                    "of human-ortholog mappings."
+                    "Establish the requested measurable baseline before "
+                    "comparing observed outcomes or associated dimensions."
                 ),
                 required_information=[
-                    "pathway-level gene membership",
-                    "FlyBase gene counts",
-                    "human-ortholog mapping counts",
+                    question,
                 ],
                 depends_on=[],
             )
@@ -941,6 +1339,89 @@ original question.
                     in step.depends_on
                     if dependency in id_mapping
                 ]
+
+        if not cls._asks_for_specific_breakdown(question):
+            baseline_step = next(
+                (
+                    step
+                    for step in plan.sub_questions
+                    if cls._looks_like_baseline_step(step)
+                ),
+                None,
+            )
+            if baseline_step is not None:
+                baseline_step.optional = False
+            for step in plan.sub_questions:
+                if baseline_step is None or step.id != baseline_step.id:
+                    step.optional = True
+
+        baseline_step = next(
+            (
+                step
+                for step in plan.sub_questions
+                if cls._looks_like_baseline_step(step)
+            ),
+            None,
+        )
+        if baseline_step is not None:
+            baseline_step.optional = False
+
+        if cls._asks_for_specific_breakdown(question):
+            for step in plan.sub_questions:
+                if baseline_step is not None and step.id == baseline_step.id:
+                    continue
+                step.optional = not cls._is_relevant_breakdown_step(
+                    question,
+                    step,
+                )
+
+        breakdown_step_exists = any(
+            cls._is_relevant_breakdown_step(question, step)
+            for step in plan.sub_questions
+            if baseline_step is None or step.id != baseline_step.id
+        )
+        if not breakdown_step_exists:
+            next_id = max(
+                (step.id for step in plan.sub_questions),
+                default=0,
+            ) + 1
+            requested_breakdown = cls._asks_for_specific_breakdown(question)
+            plan.sub_questions.append(
+                SubQuestion(
+                    id=next_id,
+                    question=(
+                        (
+                            "Compare the measured outcome across "
+                            f"{cls._requested_breakdown_label(question)} values."
+                        )
+                        if requested_breakdown
+                        and cls._requested_breakdown_label(question)
+                        else (
+                            "Compare the measured outcome across the "
+                            "explicitly requested dimensions."
+                            if requested_breakdown
+                            else
+                            "Compare the measured outcome across relevant "
+                            "dimensions available in the database."
+                        )
+                    ),
+                    objective=(
+                        "Use only dimensions present in live schema "
+                        "metadata. Identify measured associations with the "
+                        "outcome, without asserting that a segment caused it."
+                    ),
+                    required_information=[question],
+                    depends_on=(
+                        [baseline_step.id] if baseline_step is not None else []
+                    ),
+                    optional=not requested_breakdown,
+                )
+            )
+
+        if not cls._asks_for_specific_breakdown(question):
+            for step in plan.sub_questions:
+                if baseline_step is None or step.id != baseline_step.id:
+                    step.optional = True
 
         # --------------------------------------------------
         # Remove duplicate analytical steps.
@@ -1014,6 +1495,90 @@ original question.
 
         return plan
 
+    @classmethod
+    def _is_relevant_breakdown_step(
+        cls,
+        question: str,
+        step: SubQuestion,
+    ) -> bool:
+        text = f"{step.question} {step.objective}".lower()
+        dimension_terms = (
+            "product",
+            "categor",
+            "region",
+            "countr",
+            "store",
+            "location",
+            "customer",
+            "client",
+            "segment",
+            "channel",
+            "method",
+            "type",
+            "department",
+        )
+        if cls._asks_for_specific_breakdown(question):
+            requested = [
+                term
+                for term in dimension_terms
+                if re.search(
+                    rf"\b{re.escape(term)}\w*\b",
+                    question,
+                    re.IGNORECASE,
+                )
+            ]
+            return bool(requested) and any(term in text for term in requested)
+        return bool(
+            re.search(
+                r"\b(?:breakdown|broken down|segment|category|categories|"
+                r"dimension|by\s+\w+|across\s+\w+)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _asks_for_specific_breakdown(question: str) -> bool:
+        return QuestionPlanner._requested_breakdown_label(question) is not None
+
+    @staticmethod
+    def _requested_breakdown_label(question: str) -> str | None:
+        patterns = (
+            (r"\bproduct\s+categor(?:y|ies)\b", "product category"),
+            (r"\bproducts?\b", "product"),
+            (r"\bcategor(?:y|ies)\b", "category"),
+            (r"\bregions?\b", "region"),
+            (r"\bcountries\b|\bcountry\b", "country"),
+            (r"\bstores?\b", "store"),
+            (r"\blocations?\b", "location"),
+            (r"\bcustomers?\b", "customer"),
+            (r"\bclients?\b", "client"),
+            (r"\bsegments?\b", "segment"),
+            (r"\bchannels?\b", "channel"),
+            (r"\bmethods?\b", "method"),
+            (r"\btypes?\b", "type"),
+            (r"\bdepartments?\b", "department"),
+        )
+        dimension_pattern = "|".join(
+            f"(?:{pattern})"
+            for pattern, _ in patterns
+        )
+        explicitly_requested = bool(
+            re.search(
+                rf"\b(?:by|per|across)\s+(?:the\s+)?(?:{dimension_pattern})\b|"
+                rf"\bwhich\s+(?:(?:top|most|least|highest|lowest)\s+)?"
+                rf"(?:{dimension_pattern})\b",
+                question or "",
+                re.IGNORECASE,
+            )
+        )
+        if not explicitly_requested:
+            return None
+        for pattern, label in patterns:
+            if re.search(pattern, question or "", re.IGNORECASE):
+                return label
+        return None
+
     @staticmethod
     def _looks_like_baseline_step(
         step: SubQuestion,
@@ -1028,10 +1593,12 @@ original question.
             "measure",
             "count",
             "number",
-            "mapping",
             "baseline",
-            "pathway-level",
-            "pathway level",
+            "metric",
+            "value",
+            "total",
+            "rate",
+            "compare",
         ]
 
         return (
@@ -1094,23 +1661,44 @@ original question.
         ):
             return False
 
-        has_ranking = bool(
+        asks_highest = bool(
             re.search(
                 r"\b(?:most|highest|largest|maximum|top|rank|ranking)\b",
                 text,
             )
         )
+        asks_lowest = bool(
+            re.search(
+                r"\b(?:least|lowest|smallest|minimum|min)\b",
+                text,
+            )
+        )
+        has_ranking = asks_highest or asks_lowest
 
         if not has_ranking:
             return False
 
-        # A ranking request must contain a metric/value requirement.
-        # This covers "how many", "number of", "count", etc.
-        return bool(
+        # A ranking request must identify a measurable quantity.
+        has_measure = re.search(
+            r"\b(?:how many|number of|count|counts|value|values|"
+            r"amount|quantity|total|rate|ratio|percentage|percent|"
+            r"score|volume|size|metric|measure|relev\w*|strength|"
+            r"similarity|affinity|confidence)\b",
+            text,
+        )
+        has_explicit_top_n = QuestionPlanner._extract_top_n(text) is not None
+        has_measure_after_rank = bool(
             re.search(
-                r"\b(?:how many|number of|count|counts|value|values)\b",
+                r"\b(?:most|least|highest|lowest|largest|smallest|"
+                r"maximum|minimum|max|min)\s+"
+                r"(?:of\s+)?(?:the\s+)?(?:\w+\s+){0,3}\w+",
                 text,
             )
+        )
+        return bool(
+            has_measure
+            or has_explicit_top_n
+            or has_measure_after_rank
         )
 
     # ==========================================================
@@ -1188,6 +1776,26 @@ original question.
             for pattern in direct_signals
         )
 
+    @classmethod
+    def _is_simple_count_lookup(
+        cls,
+        question: str,
+    ) -> bool:
+        text = " ".join(question.lower().split())
+        if not cls._is_direct_lookup(text):
+            return False
+        if not re.search(
+            r"\b(?:how many|number of|count)\b",
+            text,
+        ):
+            return False
+        return not re.search(
+            r"\b(?:per|each|every|by|across|among|between|compare(?:d)?|"
+            r"difference|versus|vs\.?|trend|increase|decrease|change|"
+            r"previous|prior|before|after|higher|lower)\b",
+            text,
+        )
+
     # ==========================================================
     # TOP-N
     # ==========================================================
@@ -1198,7 +1806,7 @@ original question.
     ) -> int | None:
 
         match = re.search(
-            r"\btop\s+(\d+)\b",
+            r"\b(?:top|first|which)\s+(\d+)\b",
             question,
             flags=re.IGNORECASE,
         )

@@ -2,6 +2,7 @@ import json
 
 from app.llm.model_router import ModelRouter
 from app.llm.model_router import create_default_model_router
+from app.agent.query_intent import AnalyticalQueryIntent
 from app.models.sql import GeneratedSQL
 
 
@@ -25,6 +26,8 @@ class SQLGenerator:
         evidence_context: list[dict] | None = None,
         previous_sqls: list[str] | None = None,
         attempt_number: int = 1,
+        dialect: str = "postgres",
+        query_intent: AnalyticalQueryIntent | dict | None = None,
     ) -> GeneratedSQL:
 
         if not schema_context:
@@ -91,10 +94,29 @@ Generate a corrected SQL query.
 Do not repeat the previous mistake.
 """
 
+        intent_text = ""
+        if query_intent is not None:
+            intent_data = (
+                query_intent.model_dump(mode="json")
+                if isinstance(query_intent, AnalyticalQueryIntent)
+                else query_intent
+            )
+            intent_text = f"""
+Canonical analytical query intent:
+{json.dumps(intent_data, ensure_ascii=True, sort_keys=True)}
+
+Treat this schema-grounded intent as the contract for measures, filters,
+dimensions, periods, ranking direction, and result shape. Do not omit or
+silently reinterpret an intent item. If it is inconsistent with the live
+schema, report the conflict in the generated query rather than substituting
+a different measure or entity. When a metric includes a formula, evaluate
+that expression for each source row before applying its aggregation.
+"""
+
         system_instruction = """
 You are the SQL generation component of DB-Sentinel.
 
-Your job is to generate ONE PostgreSQL SELECT query that answers
+Your job is to generate ONE read-only SELECT query that answers
 the user's question using ONLY the database schema supplied below.
 
 IMPORTANT ARCHITECTURE RULE:
@@ -158,9 +180,9 @@ CORE SQL RULES
 
 10. Return only the columns required to answer the question.
 
-11. Always include LIMIT.
+11. Always include the target dialect's row-limit clause.
 
-12. LIMIT must be between 1 and 100.
+12. The row limit must be between 1 and 100.
 
 13. Never intentionally return more than 100 rows.
 
@@ -177,8 +199,12 @@ CORE SQL RULES
     facts, and they must never override the supplied live schema.
 
 17. If the requested information cannot be answered using the
-    supplied schema, generate the closest meaningful valid query.
-    The deterministic validation layer will reject unsupported SQL.
+    supplied schema, do NOT substitute a different metric, entity,
+    table, or column. Do not return placeholder text or constant-only
+    rows as if they were database evidence. Generate only a query whose
+    returned information is derived from the supplied schema; the
+    investigation layer will report when the requested evidence is
+    unavailable.
 
 18. If previous feedback is provided, correct the query accordingly.
 
@@ -193,20 +219,10 @@ CORE SQL RULES
 
     unless they actually appear in the schema.
 
-20. If a previous attempt reports a PostgreSQL syntax error,
-    repair the exact SQL construct instead of merely changing
-    aliases.
+20. If a previous attempt reports a syntax error, repair the exact
+    SQL construct using syntax supported by the target dialect.
 
-21. For PostgreSQL LATERAL table functions, use valid PostgreSQL
-    syntax.
-
-    For example:
-
-        JOIN LATERAL (...) AS alias ON TRUE
-
-    when an ON clause is required.
-
-22. Never bypass security restrictions.
+21. Never bypass security restrictions.
 
 ============================================================
 COUNTING RULES
@@ -220,16 +236,8 @@ COUNTING RULES
 
     COUNT(<entity_id>)
 
-23. This applies especially to:
-    - genes
-    - users
-    - customers
-    - products
-    - pathways
-    - transactions
-    - records
-    - IDs
-    - any entity identified by a primary key or foreign key
+23. Apply this to any entity identified by a primary key, foreign key,
+    or another unique identifier present in the supplied schema.
 
 24. If joins can duplicate an entity, COUNT(DISTINCT ...) is REQUIRED.
 
@@ -243,8 +251,10 @@ Generic pattern:
         COUNT(DISTINCT <entity_identifier>) AS <metric_alias>
     FROM <schema-qualified-table>
     GROUP BY <group_expression>
-    ORDER BY <metric_alias> DESC
-    LIMIT 100;
+        ORDER BY <metric_alias> DESC;
+
+        Also apply the target dialect's row-limit syntax with a maximum
+        of 100 rows.
 
 26. Never use COUNT(*) for an entity-count question when the joined
     tables can contain duplicate entity rows.
@@ -253,29 +263,17 @@ Generic pattern:
     primary key for COUNT(DISTINCT ...).
 
 ============================================================
-NULL / ARRAY / JSON RULES
+NULL / COLLECTION / SEMI-STRUCTURED DATA RULES
 ============================================================
 
-28. When the question asks whether a JSON/JSONB array contains one
-    or more elements, checking only:
+28. When the requested condition requires a collection, array, or
+    relationship value to contain data, exclude NULL and empty values
+    using syntax supported by the target dialect and the type recorded
+    in the supplied schema.
 
-        column IS NOT NULL
-
-    is NOT sufficient.
-
-29. For PostgreSQL JSONB arrays, prefer:
-
-        column IS NOT NULL
-        AND jsonb_array_length(column) > 0
-
-    when the column is known to contain a JSONB array.
-
-30. Do not count NULL or empty arrays as containing information.
-
-31. When the question asks for entities "with human orthologs",
-    "with mappings", "with relationships", or equivalent, make sure
-    the relevant relationship value actually contains data rather
-    than merely being non-NULL.
+29. Do not infer that a non-NULL collection or relationship field
+    contains elements unless its data type and query semantics support
+    that conclusion.
 
 ============================================================
 RANKING RULES
@@ -304,7 +302,7 @@ RANKING RULES
 
     REQUIRE an ORDER BY using the relevant metric in ASC order.
 
-35. LIMIT alone does NOT establish ranking.
+35. A row limit alone does NOT establish ranking.
 
 36. For "most", "highest", "largest", "maximum", or "top",
     use DESC.
@@ -315,7 +313,8 @@ RANKING RULES
 38. When a question asks for "top N", use:
 
         ORDER BY <metric> DESC
-        LIMIT N
+
+    with the target dialect's row-limit syntax set to N.
 
 39. When ranking aggregated entities, the ordering MUST use the
     calculated aggregate metric.
@@ -332,15 +331,21 @@ Generic pattern:
 
 40. Never claim a ranking without deterministic ORDER BY.
 
+41. When a question asks which entities have the maximum or minimum
+    metric without naming a Top-N size, return every entity tied at
+    that extreme. If the source has multiple relationship rows per
+    requested entity, first reduce them to one metric per entity
+    (using the appropriate aggregate) before ranking. Do not silently
+    choose one tied row with LIMIT 1.
+
 ============================================================
 FILTERING RULES
 ============================================================
 
 40. Apply filters required by the user's question.
 
-41. When filtering relationships represented by JSONB arrays,
-    ensure the array is non-empty when the question requires
-    the existence of at least one relationship.
+41. Apply requested relationship-presence filters using the actual
+    representation and data type documented in the supplied schema.
 
 42. Do not introduce arbitrary filters just to make a query return
     fewer rows.
@@ -375,6 +380,18 @@ OUTPUT RULES
 The deterministic DB-Sentinel security layer will independently
 validate the generated SQL before execution.
 """
+        system_instruction = (
+            f"Target SQL dialect: {dialect}. Generate syntax supported by this "
+            + "dialect; do not copy syntax from another dialect.\n\n"
+            + (
+                "For SQL Server, use TOP (n) in the SELECT clause for "
+                "row limits. For other configured relational dialects, "
+                "use LIMIT n.\n\n"
+                if dialect == "tsql"
+                else "Use LIMIT n for row limits in this dialect.\n\n"
+            )
+            + system_instruction
+        )
 
         user_prompt = f"""
 User question:
@@ -388,6 +405,8 @@ Available database schema:
 {evidence_text}
 
 {feedback_text}
+
+{intent_text}
 
 {previous_sql_text}
 
@@ -403,8 +422,8 @@ Before generating SQL, internally determine:
 3. Whether the count must be DISTINCT.
 4. Whether the question requires ranking.
 5. Whether DESC or ASC is required.
-6. Whether JSON/JSONB existence requires checking for a non-empty
-   array.
+6. Whether a collection/array condition requires checking for a
+   non-empty value using the supplied type and target dialect.
 7. Which supplied foreign-key relationships are required.
 8. Which exact columns should be returned.
 

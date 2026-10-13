@@ -3,8 +3,10 @@ import re
 import uuid
 
 from app.agent.planner import QuestionPlanner
+from app.agent.question_normalizer import QuestionNormalizer
 from app.agent.sql_pipeline import SQLPipeline
 from app.agent.logical_verifier import LogicalVerifier
+from app.agent.query_repair import QueryRepairAnalyzer
 from app.agent.evidence import Evidence, EvidenceStore
 from app.agent.insight_generator import InsightGenerator
 from app.agent.insight_verifier import InsightVerifier
@@ -17,8 +19,38 @@ from app.core.trace import logger
 from app.analysis.intent import AnalysisIntent, AnalysisIntentClassifier
 from app.analysis.explorer import DatabaseExplorer
 from app.reporting.artifacts import build_artifacts
-from app.core.console import safe_text
 from app.database.data_dictionary import DatabaseDictionary
+
+
+def _expected_top_n(question: str) -> int | None:
+    explicit = re.search(
+        r"\b(?:top|first|which)\s+(\d+)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        return int(explicit.group(1))
+    if re.search(
+        r"\b(?:all|every)\s+(?:entities|genes|items|records|rows)?\s*"
+        r"(?:that\s+are\s+)?tied\b|\ball\s+ties\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return None
+    if re.search(
+        r"\b(?:across|among|in each|per)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return None
+    if re.search(
+        r"\bwhich\b.*\b(?:more|most|highest|largest|maximum|max|"
+        r"least|lowest|smallest|minimum)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return 1
+    return None
 
 
 class InvestigationEngine:
@@ -42,6 +74,9 @@ class InvestigationEngine:
         self.planner = QuestionPlanner(
             model_router=self.model_router
         )
+        self.question_normalizer = QuestionNormalizer(
+            model_router=self.model_router
+        )
 
         self.logical_verifier = LogicalVerifier(
             model_router=self.model_router
@@ -63,6 +98,41 @@ class InvestigationEngine:
         self.sql_pipeline = SQLPipeline(
             database_manager=database_manager,
             model_router=self.model_router,
+        )
+
+    @staticmethod
+    def _failed_required_steps(step_results: list[dict]) -> list[dict]:
+        return [
+            step
+            for step in step_results
+            if (
+                step.get("status") != "verified"
+                and not (
+                    step.get("status") == "skipped"
+                    and step.get("skip_reason") == "empty_dependency"
+                )
+                and not step.get("optional", False)
+            )
+        ]
+
+    @staticmethod
+    def _asks_for_all_extreme_ties(
+        question: str,
+        objective: str,
+    ) -> bool:
+        text = f"{question or ''} {objective or ''}"
+        return bool(
+            re.search(
+                r"\b(?:maximum|minimum|highest|lowest|max|min)\b",
+                text,
+                re.IGNORECASE,
+            )
+            and re.search(
+                r"\b(?:all|every)\s+(?:entities|genes|items|records|rows)?\s*"
+                r"(?:that\s+are\s+)?tied\b|\ball\s+ties\b",
+                text,
+                re.IGNORECASE,
+            )
         )
 
     def investigate(
@@ -154,11 +224,50 @@ class InvestigationEngine:
                 },
             }
 
+        normalized_question = self.question_normalizer.normalize(
+            question,
+            conversation_history=conversation_history,
+        )
+        normalized_policy = self.request_policy.evaluate(
+            normalized_question
+        )
+        normalized_permission = self.database_permissions.check(
+            normalized_policy.operation
+        )
+        if not normalized_policy.allowed or not normalized_permission.allowed:
+            reason = (
+                normalized_policy.reason
+                if not normalized_policy.allowed
+                else normalized_permission.reason
+            )
+            logger.warning(
+                "NORMALIZED QUESTION BLOCKED id=%s operation=%s reason=%s",
+                investigation_id,
+                normalized_policy.operation,
+                reason,
+            )
+            return {
+                "status": "blocked",
+                "question": question,
+                "normalized_question": normalized_question,
+                "plan": None,
+                "steps": [],
+                "evidence": [],
+                "insight": None,
+                "insight_verification": None,
+                "reason": reason,
+                "security": {
+                    "allowed": False,
+                    "operation": normalized_policy.operation,
+                    "reason": reason,
+                },
+            }
+
         # ==================================================
         # 2. DATABASE EXPLORATION
         # ==================================================
 
-        intent = self.intent_classifier.classify(question)
+        intent = self.intent_classifier.classify(normalized_question)
         logger.info(
             "INVESTIGATION CLASSIFIED id=%s intent=%s",
             investigation_id,
@@ -171,7 +280,7 @@ class InvestigationEngine:
                 organization_id=organization_id,
             )
             overview = self.database_explorer.explore(
-                question=question,
+                question=normalized_question,
                 adapter=adapter,
                 data_dictionary=data_dictionary,
             )
@@ -214,6 +323,7 @@ class InvestigationEngine:
             return {
                 "status": "verified",
                 "question": question,
+                "normalized_question": normalized_question,
                 "intent": intent.value,
                 "plan": None,
                 "steps": [],
@@ -235,8 +345,9 @@ class InvestigationEngine:
         # ==================================================
 
         plan = self.planner.create_plan(
-            question,
+            normalized_question,
             conversation_history=conversation_history,
+            authoritative_question=question,
         )
         logger.info(
             "INVESTIGATION PLAN id=%s steps=%s",
@@ -261,6 +372,7 @@ class InvestigationEngine:
         evidence_store = EvidenceStore()
 
         step_results = []
+        empty_result_steps: set[int] = set()
 
         # ==================================================
         # 3. EXECUTE SUB-QUESTIONS
@@ -291,6 +403,7 @@ class InvestigationEngine:
             )
 
             feedback = None
+            query_intent = None
 
             # Keep every generated SQL attempt so the generator
             # can explicitly avoid repeating failed SQL.
@@ -308,6 +421,7 @@ class InvestigationEngine:
                 "depends_on": list(
                     sub_question.depends_on
                 ),
+                "optional": sub_question.optional,
                 "status": "failed",
                 "attempts": [],
             }
@@ -317,6 +431,32 @@ class InvestigationEngine:
             # ==================================================
             # DEPENDENCY CHECK
             # ==================================================
+
+            empty_dependencies = [
+                dependency_id
+                for dependency_id in sub_question.depends_on
+                if dependency_id in empty_result_steps
+            ]
+
+            if empty_dependencies:
+                step_result["status"] = "skipped"
+                step_result["skip_reason"] = "empty_dependency"
+                step_result["reason"] = (
+                    "Skipped because prerequisite step(s) "
+                    f"{empty_dependencies} returned no matching records. "
+                    "Running this dependent query without those records "
+                    "could broaden the requested scope."
+                )
+                empty_result_steps.add(sub_question.id)
+                step_results.append(step_result)
+                logger.info(
+                    "STEP SKIPPED_EMPTY_DEPENDENCY id=%s step=%s "
+                    "dependencies=%s",
+                    investigation_id,
+                    sub_question.id,
+                    empty_dependencies,
+                )
+                continue
 
             missing_dependencies = [
                 dependency_id
@@ -351,6 +491,35 @@ class InvestigationEngine:
                 for item in dependency_evidence
                 if item is not None
             ]
+
+            empty_evidence = [
+                item
+                for item in dependency_evidence
+                if not item.rows and item.total_rows == 0
+            ]
+
+            if empty_evidence:
+                empty_dependency_ids = [
+                    item.step_id for item in empty_evidence
+                ]
+                step_result["status"] = "skipped"
+                step_result["skip_reason"] = "empty_dependency"
+                step_result["reason"] = (
+                    "Skipped because verified prerequisite step(s) "
+                    f"{empty_dependency_ids} returned no matching records. "
+                    "Running this dependent query without those records "
+                    "could broaden the requested scope."
+                )
+                empty_result_steps.add(sub_question.id)
+                step_results.append(step_result)
+                logger.info(
+                    "STEP SKIPPED_EMPTY_DEPENDENCY id=%s step=%s "
+                    "dependencies=%s",
+                    investigation_id,
+                    sub_question.id,
+                    empty_dependency_ids,
+                )
+                continue
 
             dependency_context = [
                 {
@@ -438,12 +607,64 @@ class InvestigationEngine:
                 # GENERATE → VALIDATE → EXECUTE → VERIFY
                 # ==================================================
 
+                sql_question = current_question
+                if self._asks_for_all_extreme_ties(
+                    question,
+                    sub_question.objective,
+                ):
+                    sql_question += (
+                        "\nReturn all entities tied at the requested "
+                        "maximum or minimum metric, not an arbitrary "
+                        "single row. Return one row per requested entity, "
+                        "aggregating relationship rows per entity when "
+                        "needed. Order first by the requested metric "
+                        "(DESC for a maximum, ASC for a minimum), then by "
+                        "the entity identifier as a deterministic "
+                        "tie-breaker. Keep the query bounded with LIMIT "
+                        "100; the database will establish the exact tie "
+                        "count."
+                    )
+                scalar_count_request = (
+                    "single aggregate result"
+                    in sub_question.objective.lower()
+                )
+                if scalar_count_request:
+                    sql_question += (
+                        "\nReturn one scalar COUNT or SUM result for the "
+                        "requested filters, not raw records or grouped rows."
+                    )
+
+                relative_duration = (
+                    QuestionNormalizer.relative_comparison_year_count(
+                        original_question
+                    )
+                )
+                if (
+                    relative_duration
+                    and QuestionNormalizer.relative_calendar_years(
+                        original_question
+                    ) is None
+                ):
+                    sql_question += (
+                        "\nRequired relative-period contract: "
+                        f"Return one raw metric row for each of the "
+                        f"{relative_duration} latest distinct calendar "
+                        "years that actually exist in the stored data. "
+                        "Do not translate this into a rolling date window, "
+                        "use the current date, or invent a year cutoff. "
+                        "Group or derive the year from the live schema's "
+                        "actual year/date field, sort years newest first, "
+                        f"and limit the grouped year rows to "
+                        f"{relative_duration}. Use only field paths shown "
+                        "in the supplied live schema."
+                    )
+
                 pipeline_result = (
                     self.sql_pipeline
                     .generate_validate_and_execute(
                         connection_id=connection_id,
                         organization_id=organization_id,
-                        question=current_question,
+                        question=sql_question,
                         required_information=(
                             sub_question.required_information
                         ),
@@ -452,66 +673,17 @@ class InvestigationEngine:
                         evidence_context=dependency_context,
                         previous_sqls=previous_sqls,
                         attempt_number=attempt,
+                        query_intent=query_intent,
                     )
                 )
+                if pipeline_result.get("query_intent") is not None:
+                    query_intent = pipeline_result["query_intent"]
                 sql = pipeline_result.get("sql")
                 sql_hash = (
                     hashlib.sha256(str(sql).encode("utf-8")).hexdigest()[:16]
                     if sql
                     else "none"
                 )
-
-                # A bounded SELECT is a security boundary, not a semantic
-                # assertion that the user only wants the first page. For
-                # collection-style questions, complete the result through
-                # deterministic pagination when the generated query has a
-                # stable ORDER BY and the first page is full.
-                pagination_failure = False
-                pagination_reason = None
-
-                if (
-                    pipeline_result.get("executed")
-                    and pipeline_result.get("verified")
-                    and pipeline_result.get("rows")
-                ):
-                    pagination = self.sql_pipeline.collect_additional_pages(
-                        connection_id=connection_id,
-                        organization_id=organization_id,
-                        sql=pipeline_result["sql"],
-                        schema_context=schema_context,
-                        initial_rows=pipeline_result["rows"],
-                        expected_top_n=(
-                            int(top_n_match.group(1))
-                            if (
-                                top_n_match := re.search(
-                                    r"\btop\s+(\d+)\b",
-                                    original_question,
-                                    flags=re.IGNORECASE,
-                                )
-                            )
-                            else None
-                        ),
-                    )
-
-                    pipeline_result["rows"] = pagination["rows"]
-                    pipeline_result["row_count"] = len(
-                        pagination["rows"]
-                    )
-                    pipeline_result["pagination"] = {
-                        "complete": pagination["complete"],
-                        "pages": pagination["pages"],
-                        "reason": pagination["reason"],
-                    }
-
-                    if not pagination["complete"]:
-                        pagination_failure = True
-                        pagination_reason = pagination["reason"]
-                        pipeline_result["verified"] = False
-                        pipeline_result["reason"] = (
-                            "The query returned a bounded collection but "
-                            "pagination could not establish completeness: "
-                            f"{pagination_reason}"
-                        )
 
                 generated_sql = pipeline_result.get(
                     "sql"
@@ -583,9 +755,11 @@ class InvestigationEngine:
                 ].append(
                     attempt_result
                 )
+                step_result["reason"] = pipeline_result.get("reason")
                 logger.info(
                     "STEP ATTEMPT id=%s step=%s attempt=%s sql_sha256=%s "
-                    "allowed=%s executed=%s verified=%s rows=%s reason=%s",
+                    "allowed=%s executed=%s verified=%s rows=%s reason=%s "
+                    "sql=%s",
                     investigation_id,
                     sub_question.id,
                     attempt,
@@ -595,6 +769,7 @@ class InvestigationEngine:
                     pipeline_result.get("verified", False),
                     pipeline_result.get("row_count", 0),
                     pipeline_result.get("reason"),
+                    " ".join(str(sql or "").split()),
                 )
 
                 # ==================================================
@@ -614,16 +789,18 @@ class InvestigationEngine:
                             "reason"
                         ),
                     )
-                    feedback = (
-                        "The generated SQL was rejected by the "
-                        "deterministic security/schema validator.\n\n"
-                        f"Exact reason: "
-                        f"{pipeline_result.get('reason')}\n\n"
-                        "Repair only the failing construct. "
-                        "Use the exact supplied schema columns "
-                        "and choose a materially different strategy "
-                        "if the previous SQL is listed as a failed "
-                        "attempt."
+                    feedback = QueryRepairAnalyzer.create_feedback(
+                        question=(
+                            f"{original_question} "
+                            f"(current step: {current_question})"
+                        ),
+                        query_language=pipeline_result.get(
+                            "query_language",
+                            "SQL",
+                        ),
+                        failure_stage="security/schema validation",
+                        reason=str(pipeline_result.get("reason") or ""),
+                        previous_feedback=feedback,
                     )
 
                     continue
@@ -645,15 +822,18 @@ class InvestigationEngine:
                             "reason"
                         ),
                     )
-                    feedback = (
-                        "The generated SQL reached PostgreSQL "
-                        "but failed to execute.\n\n"
-                        f"Exact database error: "
-                        f"{pipeline_result.get('reason')}\n\n"
-                        "Correct the failing SQL construct while "
-                        "preserving the original question. "
-                        "Do not invent columns; use only the "
-                        "supplied schema."
+                    feedback = QueryRepairAnalyzer.create_feedback(
+                        question=(
+                            f"{original_question} "
+                            f"(current step: {current_question})"
+                        ),
+                        query_language=pipeline_result.get(
+                            "query_language",
+                            "SQL",
+                        ),
+                        failure_stage="query execution",
+                        reason=str(pipeline_result.get("reason") or ""),
+                        previous_feedback=feedback,
                     )
 
                     continue
@@ -679,37 +859,6 @@ class InvestigationEngine:
                         )
                         or {}
                     )
-
-                    # Pagination is a separate completeness gate from
-                    # structural/semantic result verification. Do not
-                    # misreport it as a verifier failure with empty
-                    # error/warning lists. This distinction is important
-                    # for collection questions such as "which ...".
-                    if pagination_failure:
-                        logger.debug(
-                            "STEP %s ATTEMPT %s COLLECTION COMPLETENESS "
-                            "FAILURE: %s",
-                            sub_question.id,
-                            attempt,
-                            pagination_reason,
-                        )
-
-                        feedback = (
-                            "The query executed and passed deterministic "
-                            "result verification, but the requested "
-                            "collection is not yet proven complete.\n\n"
-                            f"Pagination result: {pagination_reason}\n\n"
-                            "If the query uses LIMIT for a collection, "
-                            "use a deterministic ORDER BY on a real column "
-                            "from the supplied schema so the bounded result "
-                            "can be paginated safely. Do not invent a "
-                            "column and do not change the original question. "
-                            "If the query is already ordered, preserve that "
-                            "ordering and make the pagination strategy "
-                            "deterministic."
-                        )
-
-                        continue
 
                     logger.debug(
                         "STEP %s ATTEMPT %s RESULT VERIFICATION FAILURE "
@@ -740,16 +889,22 @@ class InvestigationEngine:
                         ),
                     )
 
-                    feedback = (
-                        "The query executed but deterministic "
-                        "result verification failed.\n\n"
-                        f"Result verification: "
-                        f"{verification}\n"
-                        f"Semantic verification: "
-                        f"{semantic}\n\n"
-                        "Change the SQL only enough to satisfy "
-                        "the failed verification while preserving "
-                        "the original investigation intent."
+                    feedback = QueryRepairAnalyzer.create_feedback(
+                        question=(
+                            f"{original_question} "
+                            f"(current step: {current_question})"
+                        ),
+                        query_language=pipeline_result.get(
+                            "query_language",
+                            "SQL",
+                        ),
+                        failure_stage="result verification",
+                        reason=str(pipeline_result.get("reason") or ""),
+                        diagnostics={
+                            "result verification": verification,
+                            "semantic verification": semantic,
+                        },
+                        previous_feedback=feedback,
                     )
 
                     continue
@@ -764,21 +919,23 @@ class InvestigationEngine:
                         objective=(
                             sub_question.objective
                         ),
-                        sql=pipeline_result["sql"],
+                        sql=pipeline_result.get(
+                            "source_sql",
+                            pipeline_result["sql"],
+                        ),
                         schema_context=schema_context,
                         rows=pipeline_result["rows"],
-                        pagination_complete=bool(
-                            (
-                                pipeline_result.get(
-                                    "pagination"
-                                )
-                                or {}
-                            ).get(
-                                "complete",
-                                False,
-                            )
-                        ),
+                        # This call checks whether the initial bounded rows
+                        # answer the question. Full-list completeness is
+                        # established separately below, before evidence is
+                        # accepted.
+                        pagination_complete=True,
                         attempt_number=attempt,
+                        query_language=pipeline_result.get(
+                            "query_language",
+                            connection.database_type.lower(),
+                        ),
+                        query_intent=pipeline_result.get("query_intent"),
                     )
                 )
 
@@ -839,6 +996,122 @@ class InvestigationEngine:
                 # ==================================================
 
                 if logical_result.relevant:
+                    collection_scan = pipeline_result.get(
+                        "collection_scan"
+                    )
+                    if (
+                        collection_scan
+                        and collection_scan.get("complete")
+                    ):
+                        pipeline_result["pagination"] = {
+                            "complete": True,
+                            "pages": 1,
+                            "total_rows": collection_scan["total_rows"],
+                            "reason": (
+                                "The database counted the complete "
+                                "collection in one statement and returned "
+                                "only the bounded preview."
+                            ),
+                            "mode": collection_scan["mode"],
+                        }
+                        pipeline_result["row_count"] = (
+                            collection_scan["total_rows"]
+                        )
+                        attempt_result["pagination"] = (
+                            pipeline_result["pagination"]
+                        )
+                        logger.info(
+                            "STEP PAGINATION id=%s step=%s attempt=%s "
+                            "complete=true pages=1 total_rows=%s "
+                            "mode=single_query",
+                            investigation_id,
+                            sub_question.id,
+                            attempt,
+                            collection_scan["total_rows"],
+                        )
+                    elif pipeline_result.get("rows"):
+                        pagination = self.sql_pipeline.collect_additional_pages(
+                            connection_id=connection_id,
+                            organization_id=organization_id,
+                            sql=pipeline_result["sql"],
+                            schema_context=schema_context,
+                            initial_rows=pipeline_result["rows"],
+                            expected_top_n=(
+                                _expected_top_n(
+                                    question
+                                    + " "
+                                    + sub_question.objective
+                                )
+                                if sub_question.id
+                                == plan.sub_questions[-1].id
+                                else None
+                            ),
+                        )
+                        pipeline_result["rows"] = pagination["rows"]
+                        pipeline_result["row_count"] = pagination.get(
+                            "total_rows",
+                            len(pagination["rows"]),
+                        )
+                        pipeline_result["pagination"] = {
+                            "complete": pagination["complete"],
+                            "pages": pagination["pages"],
+                            "total_rows": pipeline_result["row_count"],
+                            "reason": pagination["reason"],
+                        }
+                        attempt_result["pagination"] = (
+                            pipeline_result["pagination"]
+                        )
+                        logger.info(
+                            "STEP PAGINATION id=%s step=%s attempt=%s "
+                            "complete=%s pages=%s total_rows=%s reason=%s",
+                            investigation_id,
+                            sub_question.id,
+                            attempt,
+                            pagination["complete"],
+                            pagination["pages"],
+                            pipeline_result["row_count"],
+                            pagination["reason"],
+                        )
+
+                        if not pagination["complete"]:
+                            pipeline_result["verified"] = False
+                            pipeline_result["reason"] = (
+                                "The query returned a bounded collection "
+                                "but pagination could not establish "
+                                f"completeness: {pagination['reason']}"
+                            )
+                            step_result["status"] = "failed"
+                            step_result["reason"] = pipeline_result["reason"]
+                            if scalar_count_request:
+                                feedback = QueryRepairAnalyzer.create_feedback(
+                                    question=current_question,
+                                    query_language=pipeline_result.get(
+                                        "query_language",
+                                        "SQL",
+                                    ),
+                                    failure_stage="pagination",
+                                    reason=pagination["reason"],
+                                    diagnostics={
+                                        "required result shape": (
+                                            "one ungrouped COUNT or SUM "
+                                            "aggregate preserving all "
+                                            "requested filters"
+                                        )
+                                    },
+                                    previous_feedback=feedback,
+                                )
+                            else:
+                                feedback = QueryRepairAnalyzer.create_feedback(
+                                    question=current_question,
+                                    query_language=pipeline_result.get(
+                                        "query_language",
+                                        "SQL",
+                                    ),
+                                    failure_stage="pagination",
+                                    reason=pagination["reason"],
+                                    previous_feedback=feedback,
+                                )
+                            continue
 
                     successful_evidence = Evidence(
                         step_id=sub_question.id,
@@ -863,6 +1136,30 @@ class InvestigationEngine:
                                 pipeline_result.get("pagination")
                                 or {}
                             ).get("complete", False)
+                        ),
+                        total_rows=(
+                            pipeline_result.get("pagination") or {}
+                        ).get(
+                            "total_rows",
+                            len(pipeline_result["rows"]),
+                        ),
+                        all_extreme_ties=(
+                            (pipeline_result.get("collection_scan") or {})
+                            .get("mode")
+                            == "single_query_extreme_ties"
+                        ),
+                        ranking_metric=(
+                            (pipeline_result.get("collection_scan") or {})
+                            .get("ranking_metric")
+                        ),
+                        requested_periods=list(
+                            logical_result.requested_periods
+                        ),
+                        observed_periods=list(
+                            logical_result.observed_periods
+                        ),
+                        unavailable_periods=list(
+                            logical_result.unavailable_periods
                         ),
                     )
 
@@ -907,6 +1204,10 @@ class InvestigationEngine:
                 # LOGICAL FAILURE → RETRY
                 # ==================================================
 
+                step_result["logical_failure_reason"] = logical_result.reason
+                step_result["reason"] = logical_result.reason
+                attempt_result["reason"] = logical_result.reason
+
                 logger.debug(
                     "STEP %s ATTEMPT %s LOGICAL FAILURE: %s",
                     sub_question.id,
@@ -914,48 +1215,26 @@ class InvestigationEngine:
                     logical_result.reason,
                 )
 
-                logical_feedback = (
-                    "The query executed successfully, but the "
-                    "returned data is not sufficient to answer "
-                    "this investigation step.\n\n"
-                    f"Logical verification reason:\n"
-                    f"{logical_result.reason}\n\n"
-                    f"Missing information:\n"
-                    f"{logical_result.missing_information}\n"
-                )
-
-                if logical_result.suggested_revision:
-
-                    logical_feedback += (
-                        "Required revision suggested by the "
-                        "logical verifier:\n"
-                        f"{logical_result.suggested_revision}\n"
-                    )
-
-                # Preserve constraints learned from earlier attempts.
-                # A later logical failure must not erase an earlier
-                # security/schema requirement such as LIMIT.
-                prior_feedback = feedback
-
-                feedback = (
-                    (
-                        "Previous attempt constraints/failures that "
-                        "must still be satisfied:\n"
-                        f"{prior_feedback}\n\n"
-                    )
-                    if prior_feedback
-                    else ""
-                ) + logical_feedback + (
-                    "\nThe next SQL must use a materially different "
-                    "strategy from the rejected SQL when the verifier "
-                    "identified a semantic scope problem. Do not repeat "
-                    "the rejected table, join, filter, or aggregation "
-                    "strategy merely with cosmetic changes.\n\n"
-                    "Keep the exact original step question unchanged. "
-                    "Do not introduce ranking, comparison, or another "
-                    "analytical requirement that is not present in it. "
-                    "All previous deterministic security/schema "
-                    "requirements remain mandatory."
+                feedback = QueryRepairAnalyzer.create_feedback(
+                    question=(
+                        f"{original_question} "
+                        f"(current step: {current_question})"
+                    ),
+                    query_language=pipeline_result.get(
+                        "query_language",
+                        "SQL",
+                    ),
+                    failure_stage="logical verification",
+                    reason=logical_result.reason,
+                    diagnostics={
+                        "missing information": (
+                            logical_result.missing_information
+                        ),
+                        "required revision": (
+                            logical_result.suggested_revision
+                        ),
+                    },
+                    previous_feedback=feedback,
                 )
 
             # ==================================================
@@ -967,6 +1246,10 @@ class InvestigationEngine:
                 step_result[
                     "status"
                 ] = "failed"
+                step_result["reason"] = (
+                    step_result.get("logical_failure_reason")
+                    or step_result.get("reason")
+                )
 
                 step_result[
                     "final_question"
@@ -998,13 +1281,17 @@ class InvestigationEngine:
 
         evidence = evidence_store.all()
 
-        failed_steps = [
-            step
-            for step in step_results
-            if step.get("status") != "verified"
-        ]
+        failed_steps = self._failed_required_steps(step_results)
 
         if not evidence:
+            failed_reasons = [
+                str(
+                    step.get("reason")
+                    or (step.get("attempts") or [{}])[-1].get("reason")
+                    or "No verified evidence was produced."
+                )
+                for step in failed_steps
+            ]
             logger.warning(
                 "INVESTIGATION FAILED id=%s reason=no_verified_evidence",
                 investigation_id,
@@ -1013,14 +1300,20 @@ class InvestigationEngine:
             return {
                 "status": "failed",
                 "question": question,
+                "normalized_question": normalized_question,
                 "plan": plan.model_dump(),
                 "steps": step_results,
                 "evidence": [],
                 "insight": None,
                 "insight_verification": None,
                 "reason": (
-                    "No verified evidence could be "
-                    "collected for the investigation."
+                    "No verified evidence could be collected for the "
+                    "investigation."
+                    + (
+                        " Last failure: " + " | ".join(failed_reasons)
+                        if failed_reasons
+                        else ""
+                    )
                 ),
             }
 
@@ -1036,6 +1329,7 @@ class InvestigationEngine:
             return {
                 "status": "failed",
                 "question": question,
+                "normalized_question": normalized_question,
                 "plan": plan.model_dump(),
                 "steps": step_results,
                 "evidence": [
@@ -1049,6 +1343,12 @@ class InvestigationEngine:
                         "logical_reason": item.logical_reason,
                         "depends_on": item.depends_on,
                         "pagination_complete": item.pagination_complete,
+                        "total_rows": item.total_rows,
+                        "all_extreme_ties": item.all_extreme_ties,
+                        "ranking_metric": item.ranking_metric,
+                        "requested_periods": item.requested_periods,
+                        "observed_periods": item.observed_periods,
+                        "unavailable_periods": item.unavailable_periods,
                     }
                     for item in evidence
                 ],
@@ -1068,7 +1368,31 @@ class InvestigationEngine:
         insight = self.insight_generator.generate(
             question=question,
             evidence=evidence,
+            interpretation_question=normalized_question,
         )
+        optional_failures = [
+            step
+            for step in step_results
+            if (
+                step.get("optional", False)
+                and step.get("status") != "verified"
+            )
+        ]
+        for step in optional_failures:
+            attempts = step.get("attempts") or []
+            reason = (
+                step.get("reason")
+                or (
+                    attempts[-1].get("reason")
+                    if attempts and isinstance(attempts[-1], dict)
+                    else None
+                )
+                or "the database could not verify this supplemental analysis"
+            )
+            insight.uncertainties.append(
+                f"Supplemental analysis not verified "
+                f"({step.get('question', 'additional analysis')}): {reason}"
+            )
         logger.info(
             "INSIGHT GENERATED id=%s evidence=%s",
             investigation_id,
@@ -1084,6 +1408,7 @@ class InvestigationEngine:
                 question=question,
                 insight=insight,
                 evidence=evidence,
+                interpretation_question=normalized_question,
             )
         )
 
@@ -1133,6 +1458,12 @@ class InvestigationEngine:
                 "logical_reason": item.logical_reason,
                 "depends_on": item.depends_on,
                 "pagination_complete": item.pagination_complete,
+                "total_rows": item.total_rows,
+                "all_extreme_ties": item.all_extreme_ties,
+                "ranking_metric": item.ranking_metric,
+                "requested_periods": item.requested_periods,
+                "observed_periods": item.observed_periods,
+                "unavailable_periods": item.unavailable_periods,
             }
             for item in evidence
         ]
@@ -1145,6 +1476,7 @@ class InvestigationEngine:
         return {
             "status": status,
             "question": question,
+            "normalized_question": normalized_question,
             "plan": plan.model_dump(),
             "steps": step_results,
             "evidence": evidence_payload,
@@ -1158,199 +1490,9 @@ class InvestigationEngine:
 
 
 def main():
-    import sys
+    from app.main import run
 
-    from app.database.connection import DatabaseConnection
-
-    connection = DatabaseConnection(
-        connection_id="flybase",
-        organization_id="local",
-        workspace_id="default",
-        name="FlyBase",
-        database_type="postgresql",
-        host="chado.flybase.org",
-        port=5432,
-        database_name="flybase",
-        username="flybase",
-        password=None,
-        ssl_enabled=False,
-    )
-
-    database_manager = DatabaseManager()
-
-    database_manager.register(
-        connection
-    )
-
-    engine = InvestigationEngine(
-        database_manager=database_manager
-    )
-
-    question = " ".join(
-        sys.argv[1:]
-    ).strip() or (
-        "Which genes are rare and which are common"
-    )
-
-    print()
-    print("DB-SENTINEL")
-    print(safe_text("───────────"))
-    print("Investigation engine started")
-    print(
-        f"Question: {question}"
-    )
-
-    try:
-
-        result = engine.investigate(
-            connection_id="flybase",
-            question=question,
-        )
-
-        print()
-        print("Investigation Plan")
-        print(safe_text("──────────────────"))
-        plan = result.get("plan") or {}
-
-        for planned_step in plan.get("sub_questions", []):
-            print(
-                f"Step {planned_step.get('id')}: "
-                f"{planned_step.get('question')}"
-            )
-            print(
-                f"  Objective: {planned_step.get('objective')}"
-            )
-            print(
-                f"  Required: {planned_step.get('required_information', [])}"
-            )
-            print(
-                f"  Depends on: {planned_step.get('depends_on', [])}"
-            )
-
-        print()
-        print("Result")
-        print(safe_text("──────"))
-        print(
-            f"Status: {result['status']}"
-        )
-
-        print(
-            "Evidence: "
-            f"{len(result.get('evidence', []))} "
-            "verified step(s)"
-        )
-
-        for step in result.get(
-            "steps",
-            [],
-        ):
-
-            attempts = step.get(
-                "attempts",
-                [],
-            )
-
-            attempt_word = (
-                "attempt"
-                if len(attempts) == 1
-                else "attempts"
-            )
-
-            print(
-                f"Step {step.get('id')}: "
-                f"{step.get('status')} "
-                f"({len(attempts)} {attempt_word})"
-            )
-
-            for attempt in attempts:
-                route = attempt.get("model_route") or {}
-                logical_route = attempt.get("logical_model_route") or {}
-                if route:
-                    print(
-                        f"  SQL model: "
-                        f"{route.get('provider')}/{route.get('model')} "
-                        f"(attempt {route.get('attempt_number')})"
-                    )
-                if logical_route:
-                    print(
-                        f"  Logical verifier model: "
-                        f"{logical_route.get('provider')}/{logical_route.get('model')} "
-                        f"(attempt {logical_route.get('attempt_number')})"
-                    )
-
-
-        verification = (
-            result.get(
-                "insight_verification"
-            )
-        )
-
-        if verification:
-
-            state = (
-                "passed"
-                if verification.get(
-                    "verified"
-                )
-                else "review required"
-            )
-
-            print(
-                "Insight verification: "
-                f"{state} "
-                f"({verification.get('confidence', 0):.2f})"
-            )
-
-            warnings = (
-                verification.get(
-                    "warnings"
-                )
-                or []
-            )
-
-            if warnings:
-
-                print(
-                    f"Warnings: {len(warnings)}"
-                )
-
-        if result.get(
-            "insight"
-        ):
-
-            insight = result[
-                "insight"
-            ]
-
-            print()
-            print("Insight")
-            print(safe_text("───────"))
-
-            print(
-                insight.get(
-                    "summary",
-                    "",
-                )
-            )
-
-            for finding in insight.get(
-                "findings",
-                [],
-            ):
-
-                print(
-                    f"{safe_text('•')} {finding}"
-                )
-
-        print()
-        print(
-            "Detailed execution trace: "
-            "logs/db-sentinel.log"
-        )
-
-    finally:
-
-        database_manager.close_all()
+    run()
 
 
 if __name__ == "__main__":

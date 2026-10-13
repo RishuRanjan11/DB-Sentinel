@@ -4,6 +4,7 @@ from app.database.connection import DatabaseConnection
 from app.database.adapters.base import DatabaseAdapter
 from app.database.adapters.factory import DatabaseAdapterRegistry
 from app.database.adapters.postgresql import PostgreSQLAdapter
+from app.database.adapters.sqlalchemy_relational import SQLAlchemyRelationalAdapter
 
 
 class DatabaseManager:
@@ -18,6 +19,25 @@ class DatabaseManager:
         self.adapter_registry = adapter_registry or DatabaseAdapterRegistry()
         if "postgresql" not in self.adapter_registry.supported_types():
             self.adapter_registry.register("postgresql", PostgreSQLAdapter)
+        if "postgres" not in self.adapter_registry.supported_types():
+            self.adapter_registry.register("postgres", PostgreSQLAdapter)
+        for database_type in (
+            "mysql",
+            "sqlserver",
+            "sql server",
+            "microsoft sql server",
+            "mssql",
+            "sql",
+        ):
+            if database_type not in self.adapter_registry.supported_types():
+                self.adapter_registry.register(
+                    database_type,
+                    SQLAlchemyRelationalAdapter,
+                )
+        if "mongodb" not in self.adapter_registry.supported_types():
+            from app.database.adapters.mongodb import MongoDBAdapter
+
+            self.adapter_registry.register("mongodb", MongoDBAdapter)
 
         self._adapters: dict[str, DatabaseAdapter] = {}
         self._connections: dict[str, DatabaseConnection] = {}

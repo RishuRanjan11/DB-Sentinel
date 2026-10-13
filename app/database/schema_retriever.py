@@ -189,6 +189,7 @@ def find_relevant_tables(
 ):
 
     results = []
+    available_tables = []
 
     if schemas is None:
         schemas = adapter.get_schemas()
@@ -205,6 +206,7 @@ def find_relevant_tables(
                 schema=schema,
                 table=table,
             )
+            available_tables.append((schema, table, details))
             if data_dictionary:
                 details = data_dictionary.enrich_schema_context(
                     [{**details, "schema": schema, "table": table}]
@@ -245,6 +247,16 @@ def find_relevant_tables(
                     "details": details,
                 }
             )
+
+    if not results and len(available_tables) == 1:
+        schema, table, details = available_tables[0]
+        results.append({
+            "schema": schema,
+            "table": table,
+            "score": 0,
+            "matched_terms": [],
+            "details": details,
+        })
 
     results.sort(
         key=lambda result: (

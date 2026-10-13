@@ -1,5 +1,6 @@
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -11,6 +12,17 @@ from app.core.trace import logger
 
 
 class PostgreSQLAdapter(DatabaseAdapter):
+    _SUPABASE_HOST_SUFFIXES = (".supabase.com", ".supabase.co")
+    _SUPABASE_MANAGED_SCHEMAS = frozenset({
+        "auth",
+        "extensions",
+        "graphql",
+        "graphql_public",
+        "pgbouncer",
+        "realtime",
+        "storage",
+        "vault",
+    })
 
     def __init__(self, connection: DatabaseConnection):
         if connection.database_type.lower() != "postgresql":
@@ -21,6 +33,7 @@ class PostgreSQLAdapter(DatabaseAdapter):
 
         self.connection = connection
         self.engine: Engine | None = None
+        self.last_connection_error: str | None = None
 
         # Metadata cache.
         #
@@ -29,6 +42,19 @@ class PostgreSQLAdapter(DatabaseAdapter):
         self._schema_cache: dict[tuple[str, str], dict] = {}
         self._schema_cache_loaded = False
         self._schema_cache_lock = Lock()
+
+    def _is_supabase_host(self) -> bool:
+        host = (self.connection.host or "").lower()
+        return host.endswith(self._SUPABASE_HOST_SUFFIXES)
+
+    def _managed_schema_filter(self, column: str) -> str:
+        if not self._is_supabase_host():
+            return ""
+        schemas = ", ".join(
+            f"'{schema}'"
+            for schema in sorted(self._SUPABASE_MANAGED_SCHEMAS)
+        )
+        return f" AND {column} NOT IN ({schemas})"
 
     def connect(self) -> None:
         if self.engine is not None:
@@ -70,16 +96,27 @@ class PostgreSQLAdapter(DatabaseAdapter):
         )
 
     def test_connection(self) -> bool:
-        self.connect()
-
         try:
+            self.connect()
             with self.engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
 
+            self.last_connection_error = None
             return True
 
         except Exception as error:
-            logger.warning("Database connection test failed: %s", error)
+            message = str(error)
+            if self.connection.password:
+                message = message.replace(
+                    self.connection.password,
+                    "[REDACTED]",
+                )
+                message = message.replace(
+                    quote(self.connection.password, safe=""),
+                    "[REDACTED]",
+                )
+            self.last_connection_error = message
+            logger.warning("Database connection test failed: %s", message)
             return False
 
     def execute(
@@ -104,13 +141,15 @@ class PostgreSQLAdapter(DatabaseAdapter):
     def get_schemas(self) -> list[str]:
         self.connect()
 
-        query = text("""
+        query = text(f"""
             SELECT schema_name
             FROM information_schema.schemata
             WHERE schema_name NOT IN (
                 'information_schema',
                 'pg_catalog'
             )
+              AND schema_name NOT LIKE 'pg\\_%' ESCAPE '\\'
+              {self._managed_schema_filter("schema_name")}
             ORDER BY schema_name
         """)
 
@@ -130,6 +169,11 @@ class PostgreSQLAdapter(DatabaseAdapter):
         self.connect()
 
         if schema:
+            if (
+                self._is_supabase_host()
+                and schema.lower() in self._SUPABASE_MANAGED_SCHEMAS
+            ):
+                return []
             query = text("""
                 SELECT table_name
                 FROM information_schema.tables
@@ -143,13 +187,15 @@ class PostgreSQLAdapter(DatabaseAdapter):
             }
 
         else:
-            query = text("""
+            query = text(f"""
                 SELECT table_schema, table_name
                 FROM information_schema.tables
                 WHERE table_schema NOT IN (
                     'information_schema',
                     'pg_catalog'
                 )
+                AND table_schema NOT LIKE 'pg\\_%' ESCAPE '\\'
+                {self._managed_schema_filter("table_schema")}
                 AND table_type = 'BASE TABLE'
                 ORDER BY table_schema, table_name
             """)
@@ -198,7 +244,7 @@ class PostgreSQLAdapter(DatabaseAdapter):
 
             self.connect()
 
-            columns_query = text("""
+            columns_query = text(f"""
                 SELECT
                     n.nspname AS schema_name,
                     c.relname AS table_name,
@@ -220,13 +266,14 @@ class PostgreSQLAdapter(DatabaseAdapter):
                       'information_schema',
                       'pg_catalog'
                   )
+                  {self._managed_schema_filter("n.nspname")}
                 ORDER BY
                     n.nspname,
                     c.relname,
                     a.attnum
             """)
 
-            primary_key_query = text("""
+            primary_key_query = text(f"""
                 SELECT
                     n.nspname AS schema_name,
                     c.relname AS table_name,
@@ -248,13 +295,14 @@ class PostgreSQLAdapter(DatabaseAdapter):
                       'information_schema',
                       'pg_catalog'
                   )
+                  {self._managed_schema_filter("n.nspname")}
                 ORDER BY
                     n.nspname,
                     c.relname,
                     column_position
             """)
 
-            foreign_key_query = text("""
+            foreign_key_query = text(f"""
                 SELECT
                     source_namespace.nspname
                         AS schema_name,
@@ -328,6 +376,8 @@ class PostgreSQLAdapter(DatabaseAdapter):
                       'information_schema',
                       'pg_catalog'
                   )
+                  {self._managed_schema_filter("source_namespace.nspname")}
+                  {self._managed_schema_filter("target_namespace.nspname")}
 
                 ORDER BY
                     source_namespace.nspname,
